@@ -53,17 +53,15 @@ extern "C" __global__ void paged_attention_v1_plus(
         // Dot product Q * K
         float qk = q_val * k_val;
 
-        // Warp-level reduction
-        unsigned int mask = __activemask();
+        // Warp-level reduction (Full warp reduction is safe because block_dim is multiple of 32)
         for (int offset = 16; offset > 0; offset >>= 1) {
-            qk += __shfl_xor_sync(mask, qk, offset);
+            qk += __shfl_xor_sync(0xffffffff, qk, offset);
         }
 
         float score;
         if (head_dim <= 32) {
-            score = __shfl_sync(mask, qk, 0) * scale;
+            score = __shfl_sync(0xffffffff, qk, 0) * scale;
         } else {
-            __shared__ float s_score;
             int warp_id = tid / 32;
             int lane_id = tid % 32;
             if (lane_id == 0) {
@@ -71,15 +69,11 @@ extern "C" __global__ void paged_attention_v1_plus(
             }
             __syncthreads();
 
-            if (tid == 0) {
-                float sum = 0;
-                for (int i = 0; i < (head_dim + 31) / 32; ++i) {
-                    sum += s_reduce[i];
-                }
-                s_score = sum * scale;
+            float sum = 0;
+            for (int i = 0; i < (head_dim + 31) / 32; ++i) {
+                sum += s_reduce[i];
             }
-            __syncthreads();
-            score = s_score;
+            score = sum * scale;
         }
 
         // Online Softmax (FlashAttention-style)

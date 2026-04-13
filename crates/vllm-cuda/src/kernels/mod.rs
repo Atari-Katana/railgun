@@ -171,9 +171,10 @@ impl PagedAttentionKernels {
             .load_function("paged_attention_v1_plus")
             .map_err(|e| CoreError::Tensor(format!("Failed to load paged_attention_v1_plus function: {e}")))?;
 
+        let block_size_x = ((head_dim + 31) / 32 * 32) as u32;
         let cfg = LaunchConfig {
             grid_dim: ((batch_size * num_heads) as u32, 1, 1),
-            block_dim: (head_dim as u32, 1, 1),
+            block_dim: (block_size_x, 1, 1),
             shared_mem_bytes: (((head_dim + 31) / 32) * 4) as u32, // Enough for warp partial sums
         };
 
