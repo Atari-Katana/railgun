@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 use cudarc::driver::{CudaDevice, LaunchConfig};
-use vllm_core::{CoreError, Result, Device};
+use vllm_core::{CoreError, Result, Device as VllmDevice};
 
 /// The PTX content for the PagedAttention kernels, compiled by build.rs.
 pub const PAGED_ATTENTION_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/paged_attention.ptx"));
-const ROPE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.ptx"));
+pub const ROPE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.ptx"));
 
 /// Interface to optimized CUDA kernels for Railgun.
 pub struct PagedAttentionKernels {
@@ -25,7 +25,7 @@ impl PagedAttentionKernels {
                 "reshape_and_cache"
             ])
             .map_err(|e| CoreError::DeviceInit {
-                device: Device::Cuda(ordinal),
+                device: VllmDevice::Cuda(ordinal as u32),
                 reason: format!("Failed to load PagedAttention PTX: {e}"),
             })?;
 
@@ -33,7 +33,7 @@ impl PagedAttentionKernels {
         device
             .load_ptx(ROPE_PTX.into(), "rope_kernels", &["rotary_embedding_kernel"])
             .map_err(|e| CoreError::DeviceInit {
-                device: Device::Cuda(ordinal),
+                device: VllmDevice::Cuda(ordinal as u32),
                 reason: format!("Failed to load RoPE PTX: {e}"),
             })?;
 

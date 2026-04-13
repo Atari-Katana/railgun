@@ -14,7 +14,7 @@ vllm-core  = { path = "../vllm-core" }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
 candle-core = { workspace = true, optional = true }
-cudarc     = { workspace = true, optional = true }
+cudarc     = { workspace = true, optional = true, features = ["driver"] }
 
 [build-dependencies]
 # Reserved for nvcc kernel compilation in later phases

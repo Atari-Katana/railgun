@@ -19,60 +19,31 @@
 //! that are safe to store in GPU memory as flat bytes). The blanket impls cover
 //! all primitive numeric types (`f32`, `f16`, `u32`, `i32`, …).
 
-use std::sync::Arc;
-
-use cudarc::driver::{CudaDevice, CudaSlice, CudaViewMut, DeviceRepr};
+use candle_core::CudaDevice;
+use cudarc::driver::{CudaSlice, CudaViewMut, DeviceRepr};
 
 use super::context::{CudaError, CudaResult};
 
 /// An owned buffer of `T` residing in CUDA device memory.
-///
-/// # Lifetimes and Ownership
-///
-/// The buffer holds an `Arc<CudaDevice>` so it can outlive the
-/// [`CudaContext`] that created it, as long as the underlying device
-/// remains valid. Drop-order between buffers does not matter.
 pub struct DeviceBuffer<T: DeviceRepr> {
     slice: CudaSlice<T>,
-    device: Arc<CudaDevice>,
+    device: CudaDevice,
     len: usize,
 }
 
 impl<T: DeviceRepr + 'static> DeviceBuffer<T> {
-    /// Allocate an uninitialised buffer of `len` elements on the given device.
-    ///
-    /// # Arguments
-    ///
-    /// * `len`    – Number of elements to allocate.
-    /// * `device` – The owning CUDA device context.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CudaError::OutOfMemory`] (surfaced as a [`CudaError::Driver`]
-    /// variant) if device memory is exhausted.
-    ///
-    /// # Safety rationale
-    ///
-    /// `cudarc::CudaDevice::alloc` performs the raw allocation.
-    /// The returned `CudaSlice` is not usable until explicitly written.
-    /// We expose this as safe because reading uninitialised GPU memory
-    /// is prevented by the API: `copy_to_host` requires `len` elements
-    /// to be written first, enforced by caller discipline documented here.
-    pub fn alloc(len: usize, device: Arc<CudaDevice>) -> CudaResult<Self> {
-        // SAFETY: cudarc's alloc returns an uninitialised slice.
-        // Users must write data before reading it; the API makes this explicit.
-        let slice = unsafe { device.alloc::<T>(len) }.map_err(CudaError::Driver)?;
+    pub fn alloc(len: usize, device: CudaDevice) -> CudaResult<Self> {
+        let slice = unsafe { device.device().alloc::<T>(len) }
+            .map_err(|e| CudaError::Driver(candle_core::Error::from(e)))?;
         Ok(Self { slice, device, len })
     }
 
-    /// Allocate a buffer and fill it with zeros.
-    ///
-    /// This is the preferred constructor when you need a clean buffer.
-    pub fn zeros(len: usize, device: Arc<CudaDevice>) -> CudaResult<Self>
+    pub fn zeros(len: usize, device: CudaDevice) -> CudaResult<Self>
     where
         T: cudarc::driver::ValidAsZeroBits,
     {
-        let slice = device.alloc_zeros::<T>(len).map_err(CudaError::Driver)?;
+        let slice = device.device().alloc_zeros::<T>(len)
+            .map_err(|e| CudaError::Driver(candle_core::Error::from(e)))?;
         Ok(Self {
             slice,
             device,
@@ -113,9 +84,9 @@ impl<T: DeviceRepr + 'static> DeviceBuffer<T> {
             len = data.len(),
             buf = self.len
         );
-        self.device
+        self.device.device()
             .htod_sync_copy_into(data, &mut self.slice)
-            .map_err(CudaError::Driver)
+            .map_err(|e| CudaError::Driver(candle_core::Error::from(e)))
     }
 
     /// Copy this buffer to a host `Vec<T>`.
@@ -129,9 +100,9 @@ impl<T: DeviceRepr + 'static> DeviceBuffer<T> {
     where
         T: Clone,
     {
-        self.device
+        self.device.device()
             .dtoh_sync_copy(&self.slice)
-            .map_err(CudaError::Driver)
+            .map_err(|e| CudaError::Driver(candle_core::Error::from(e)))
     }
 
     /// Returns a mutable view for use in cudarc kernel launches.

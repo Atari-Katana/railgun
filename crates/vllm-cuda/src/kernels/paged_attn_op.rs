@@ -4,8 +4,7 @@
 //! Railgun to plug its hand-optimized CUDA kernels directly into the 
 //! Candle computation graph.
 
-use candle_core::{CudaDevice, CudaStorage, Device, Layout, Result, Shape, Tensor};
-use cudarc::driver::{CudaSlice, DeviceRepr, LaunchAsync, LaunchConfig};
+use candle_core::{CudaDevice, CudaStorage, Device, Layout, Result, Shape, Tensor, CpuStorage};
 use crate::kernels::PagedAttentionKernels;
 
 /// The PagedAttention Custom Operation.
@@ -23,15 +22,12 @@ impl candle_core::CustomOp1 for PagedAttentionOp {
         "paged_attention"
     }
 
-    fn forward(&self, q: &CudaStorage, layout: &Layout, device: &CudaDevice) -> Result<(CudaStorage, Shape)> {
-        // This is where it gets tricky: PagedAttention normally takes MULTIPLE inputs.
-        // CustomOp1 only takes one. We should use CustomOp3 or higher, or wrap inputs into a single tensor.
-        // However, for KV cache, they are semi-static.
-        
-        // Actually, Candle's CustomOp trait family (CustomOp1, CustomOp2, etc.) is for 
-        // standard backprop-able ops. For PagedAttention, we might just want to 
-        // use a direct function that works on CudaStorage or tensors.
-        
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        Err(candle_core::Error::Msg("paged_attention is only implemented for CUDA".to_string()))
+    }
+
+    fn cuda_fwd(&self, _: &CudaStorage, _: &Layout) -> Result<(CudaStorage, Shape)> {
+        // We use PagedAttentionOp::execute instead for better multi-input support
         Err(candle_core::Error::Msg("Use PagedAttentionOp::execute instead".to_string()))
     }
 }
@@ -64,7 +60,7 @@ impl PagedAttentionOp {
         let (bt_storage, _) = block_table.storage_and_layout();
         let (cl_storage, _) = context_lens.storage_and_layout();
 
-        match (q_storage.as_ref(), k_storage.as_ref(), v_storage.as_ref(), bt_storage.as_ref(), cl_storage.as_ref()) {
+        match (&*q_storage, &*k_storage, &*v_storage, &*bt_storage, &*cl_storage) {
             (
                 candle_core::Storage::Cuda(q_cuda),
                 candle_core::Storage::Cuda(k_cuda),
@@ -72,7 +68,7 @@ impl PagedAttentionOp {
                 candle_core::Storage::Cuda(bt_cuda),
                 candle_core::Storage::Cuda(cl_cuda),
             ) => {
-                let dev = q_cuda.device();
+                let dev = q_cuda.device.clone();
                 let out_shape = Shape::from((batch_size, num_heads, head_dim));
                 let out_size = out_shape.elem_count();
                 let mut out_cuda = dev.alloc_zeros::<f32>(out_size).map_err(candle_core::Error::from)?;
@@ -96,7 +92,7 @@ impl PagedAttentionOp {
                 }
 
                 let new_storage = candle_core::CudaStorage::wrap_cuda_slice(out_cuda, dev.clone());
-                Ok(Tensor::from_storage(candle_core::Storage::Cuda(new_storage), out_shape, false))
+                Ok(Tensor::from_storage(candle_core::Storage::Cuda(new_storage), out_shape, candle_core::op::BackpropOp::none(), false))
             }
             _ => Err(candle_core::Error::Msg("PagedAttentionOp requires CUDA tensors".to_string())),
         }
@@ -119,7 +115,7 @@ impl PagedAttentionOp {
         let (vc_storage, _) = v_cache.storage_and_layout();
         let (slot_storage, _) = slot_mapping.storage_and_layout();
 
-        match (k_storage.as_ref(), v_storage.as_ref(), kc_storage.as_ref(), vc_storage.as_ref(), slot_storage.as_ref()) {
+        match (&*k_storage, &*v_storage, &*kc_storage, &*vc_storage, &*slot_storage) {
             (
                 candle_core::Storage::Cuda(k_cuda),
                 candle_core::Storage::Cuda(v_cuda),
@@ -161,7 +157,7 @@ impl PagedAttentionOp {
         let (cs_storage, _) = cos_sin.storage_and_layout();
         let (pos_storage, _) = positions.storage_and_layout();
 
-        match (x_storage.as_ref(), cs_storage.as_ref(), pos_storage.as_ref()) {
+        match (&*x_storage, &*cs_storage, &*pos_storage) {
             (
                 candle_core::Storage::Cuda(x_cuda),
                 candle_core::Storage::Cuda(cs_cuda),

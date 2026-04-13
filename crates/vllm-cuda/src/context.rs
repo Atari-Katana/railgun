@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::CudaDevice;
+use candle_core::CudaDevice;
 use thiserror::Error;
 use tracing::debug;
 
@@ -31,12 +31,12 @@ pub enum CudaError {
     #[error("CUDA init failed for device {ordinal}: {source}")]
     Init {
         ordinal: u32,
-        source: cudarc::driver::DriverError,
+        source: candle_core::Error,
     },
 
     /// A CUDA runtime operation failed.
     #[error("CUDA operation failed: {0}")]
-    Driver(#[from] cudarc::driver::DriverError),
+    Driver(#[from] candle_core::Error),
 }
 
 pub type CudaResult<T> = std::result::Result<T, CudaError>;
@@ -44,42 +44,22 @@ pub type CudaResult<T> = std::result::Result<T, CudaError>;
 use crate::kernels::PagedAttentionKernels;
 
 /// Owns a CUDA device and its primary stream.
-///
-/// All allocations and kernel launches issued through this context share
-/// the same CUDA stream by default, ensuring ordered execution.
 pub struct CudaContext {
-    device: Arc<CudaDevice>,
+    device: CudaDevice,
     kernels: PagedAttentionKernels,
     ordinal: u32,
 }
 
 impl CudaContext {
-    /// Create a new context for the CUDA device with the given ordinal.
-    ///
-    /// # Arguments
-    ///
-    /// * `ordinal` – Zero-based GPU index (as reported by `nvidia-smi`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CudaError::Init`] if the device cannot be opened (e.g. the
-    /// ordinal is out of range, or the CUDA driver is not installed).
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use vllm_cuda::CudaContext;
-    /// let ctx = CudaContext::new(0).unwrap();
-    /// ```
     pub fn new(ordinal: u32) -> CudaResult<Self> {
         debug!(%ordinal, "creating CUDA context");
-        let device = Arc::new(CudaDevice::new(ordinal as usize).map_err(|e| CudaError::Init {
+        let device = CudaDevice::new(ordinal as usize).map_err(|e| CudaError::Init {
             ordinal,
             source: e,
-        })?);
+        })?;
         
-        let kernels = PagedAttentionKernels::new(device.clone(), ordinal as usize)
-            .map_err(|e| CudaError::Driver(cudarc::driver::DriverError::Unknown(0)))?; // Simplified for now
+        let kernels = PagedAttentionKernels::new(Arc::new(device.clone()), ordinal as usize)
+            .map_err(|e| CudaError::Driver(candle_core::Error::Msg(format!("Kernel init failed: {e}"))))?;
 
         Ok(Self {
             device,
@@ -88,45 +68,26 @@ impl CudaContext {
         })
     }
 
-    /// Returns the device ordinal passed at construction.
-    #[inline]
     pub fn ordinal(&self) -> u32 {
         self.ordinal
     }
 
-    /// Returns a reference to the loaded CUDA kernels.
-    #[inline]
     pub fn kernels(&self) -> &PagedAttentionKernels {
         &self.kernels
     }
 
-    /// Returns a clone of the underlying `Arc<CudaDevice>`.
-    ///
-    /// Useful for passing the device to cudarc allocation helpers.
-    #[inline]
-    pub fn device(&self) -> Arc<CudaDevice> {
-        Arc::clone(&self.device)
+    pub fn device(&self) -> CudaDevice {
+        self.device.clone()
     }
 
-    /// Block the calling thread until all operations on this device's
-    /// default stream have completed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CudaError::Driver`] if the synchronisation call fails.
     pub fn synchronize(&self) -> CudaResult<()> {
-        self.device.synchronize().map_err(CudaError::Driver)
+        // Candle's CudaDevice doesn't have a direct synchronize in some versions,
+        // but we can get it from the underlying cudarc device.
+        self.device.device().synchronize().map_err(|e| CudaError::Driver(candle_core::Error::from(e)))
     }
 
-    /// Returns the amount of free and total memory on this device, in bytes.
-    ///
-    /// The tuple is `(free, total)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CudaError::Driver`] if the query fails.
     pub fn memory_info(&self) -> CudaResult<(usize, usize)> {
-        self.device.memory_info().map_err(CudaError::Driver)
+        self.device.device().memory_info().map_err(|e| CudaError::Driver(candle_core::Error::from(e)))
     }
 }
 
