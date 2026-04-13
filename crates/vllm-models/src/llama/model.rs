@@ -20,10 +20,10 @@ use std::path::Path;
 
 use candle_core::{DType as CDType, Device as CDevice, Tensor as CTensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::llama::{Cache, Config as LlamaInnerConfig, Llama};
+use candle_transformers::models::llama::{Config as LlamaInnerConfig, LlamaEosToks};
 use tracing::info;
 
-use vllm_core::{CoreError, Device, DType, Result, Tensor};
+use vllm_core::{CoreError, Device, Result, Tensor};
 
 use crate::config::ModelConfig;
 use crate::traits::CausalLM;
@@ -41,14 +41,12 @@ fn to_candle_config(cfg: &ModelConfig) -> LlamaInnerConfig {
         num_hidden_layers: cfg.num_hidden_layers,
         num_attention_heads: cfg.num_attention_heads,
         num_key_value_heads: cfg.num_kv_heads(),
+        use_flash_attn: false,
         rms_norm_eps: cfg.rms_norm_eps,
         rope_theta: cfg.rope_theta as f32,
-        use_flash_attn: false, // Phase 5: enable flash-attn
         bos_token_id: cfg.bos_token_id,
-        eos_token_id: cfg.eos_token_id.map(|id| {
-            candle_transformers::models::llama::LlamaEosToks::Single(id)
-        }),
-        rope_scaling: None, // Llama 3.1+ scaling handled in Phase 5
+        eos_token_id: cfg.eos_token_id.map(LlamaEosToks::Single),
+        rope_scaling: None,
         max_position_embeddings: cfg.max_position_embeddings,
         tie_word_embeddings: false,
     }
@@ -85,7 +83,6 @@ use crate::llama::architecture::RailgunLlama;
 pub struct LlamaModel {
     inner: RailgunLlama,
     config: ModelConfig,
-    candle_config: LlamaInnerConfig,
     device: Device,
     dtype: CDType,
 }
@@ -118,7 +115,6 @@ impl LlamaModel {
         Ok(Self {
             inner,
             config,
-            candle_config,
             device,
             dtype,
         })

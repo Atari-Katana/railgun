@@ -1,15 +1,14 @@
 //! Native Llama implementation with PagedAttention support.
 
-use candle_core::{Device, Result, Tensor, D};
-use candle_nn::{Embedding, Linear, Module, RMSNorm, VarBuilder};
-use crate::config::ModelConfig;
+use candle_core::{Result, Tensor};
+use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder};
 use crate::llama::attention::PagedSelfAttention;
 
 pub struct LlamaLayer {
     attention: PagedSelfAttention,
     mlp: LlamaMLP,
-    attention_norm: RMSNorm,
-    ffn_norm: RMSNorm,
+    attention_norm: RmsNorm,
+    ffn_norm: RmsNorm,
 }
 
 impl LlamaLayer {
@@ -35,7 +34,7 @@ impl LlamaLayer {
         x: &Tensor,
         block_table: &Tensor,
         context_lens: &Tensor,
-        slot_mapping: &Tensor,
+        _slot_mapping: &Tensor,
         kv_cache: &mut vllm_paged_attention::block::BlockPool,
     ) -> Result<Tensor> {
         let residual = x;
@@ -43,13 +42,13 @@ impl LlamaLayer {
         
         // Paged attention step
         // In Phase 5, this will call the custom kernel via PagedAttentionOp
-        let x = self.attention.forward(&x, block_table, context_lens, kv_cache)?;
+        let x = self.attention.forward(&x, block_table, context_lens, _slot_mapping, kv_cache)?;
         let x = (x + residual)?;
         
         let residual = &x;
         let x = self.ffn_norm.forward(&x)?;
         let x = self.mlp.forward(&x)?;
-        (x + residual)
+        x + residual
     }
 }
 
@@ -66,9 +65,9 @@ impl LlamaMLP {
     ) -> Result<Self> {
         let h = cfg.hidden_size;
         let i = cfg.intermediate_size;
-        let gate_proj = candle_nn::linear(h, i, vb.pp("gate_proj"))?;
-        let up_proj = candle_nn::linear(h, i, vb.pp("up_proj"))?;
-        let down_proj = candle_nn::linear(i, h, vb.pp("down_proj"))?;
+        let gate_proj = candle_nn::linear_no_bias(h, i, vb.pp("gate_proj"))?;
+        let up_proj = candle_nn::linear_no_bias(h, i, vb.pp("up_proj"))?;
+        let down_proj = candle_nn::linear_no_bias(i, h, vb.pp("down_proj"))?;
         Ok(Self { gate_proj, up_proj, down_proj })
     }
 
@@ -82,7 +81,7 @@ impl LlamaMLP {
 pub struct RailgunLlama {
     embed_tokens: Embedding,
     layers: Vec<LlamaLayer>,
-    norm: RMSNorm,
+    norm: RmsNorm,
     lm_head: Linear,
 }
 
@@ -98,7 +97,16 @@ impl RailgunLlama {
             layers.push(LlamaLayer::load(vb_layers.pp(i), cfg)?);
         }
         let norm = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
-        let lm_head = candle_nn::linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+        
+        let lm_head = if vb.contains_tensor("lm_head.weight") {
+            candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+        } else {
+            // Tied embeddings: use embed_tokens weight
+            let vocab_size = cfg.vocab_size;
+            let hidden_size = cfg.hidden_size;
+            let weight = vb.pp("model.embed_tokens").get((vocab_size, hidden_size), "weight")?;
+            candle_nn::Linear::new(weight, None)
+        };
         
         Ok(Self { embed_tokens, layers, norm, lm_head })
     }
@@ -111,7 +119,7 @@ impl RailgunLlama {
         slot_mapping: &Tensor,
         kv_cache: &mut vllm_paged_attention::block::BlockPool,
     ) -> Result<Tensor> {
-        let (b_sz, seq_len) = tokens.dims2()?;
+        let (_b_sz, seq_len) = tokens.dims2()?;
         let mut x = self.embed_tokens.forward(tokens)?;
         for layer in &self.layers {
             x = layer.forward(&x, block_table, context_lens, slot_mapping, kv_cache)?;
@@ -135,5 +143,13 @@ impl RailgunLlama {
         }
         x = self.norm.forward(&x)?;
         self.lm_head.forward(&x)
+    }
+
+    pub fn num_kv_heads(&self) -> usize {
+        self.layers[0].attention.num_kv_heads()
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.layers[0].attention.head_dim()
     }
 }

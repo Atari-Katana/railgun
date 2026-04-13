@@ -4,7 +4,7 @@
 //! Railgun to plug its hand-optimized CUDA kernels directly into the 
 //! Candle computation graph.
 
-use candle_core::{CudaDevice, CudaStorage, Device, Layout, Result, Shape, Tensor, CpuStorage};
+use candle_core::{CudaStorage, Layout, Result, Shape, Tensor, CpuStorage};
 use crate::kernels::PagedAttentionKernels;
 
 /// The PagedAttention Custom Operation.
@@ -49,12 +49,12 @@ impl PagedAttentionOp {
         block_table: &Tensor,
         context_lens: &Tensor,
     ) -> Result<Tensor> {
-        let device = q.device();
+        let _device = q.device();
         let (batch_size, num_heads, head_dim) = q.dims3()?;
-        let (_, num_kv_heads, block_size, _) = k_cache.dims4()?;
+        let (_, _num_kv_heads, block_size, _) = k_cache.dims4()?;
         let max_blocks = block_table.dim(1)?;
 
-        let (q_storage, q_layout) = q.storage_and_layout();
+        let (q_storage, _q_layout) = q.storage_and_layout();
         let (k_storage, _) = k_cache.storage_and_layout();
         let (v_storage, _) = v_cache.storage_and_layout();
         let (bt_storage, _) = block_table.storage_and_layout();

@@ -21,8 +21,8 @@ impl Sampler {
         
         let processor = LogitsProcessor::new(
             seed,
-            Some(params.temperature),
-            Some(params.top_p),
+            Some(params.temperature as f64),
+            Some(params.top_p as f64),
         );
 
         Self { processor }

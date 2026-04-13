@@ -11,6 +11,7 @@ vllm-paged-attention = { path = "../vllm-paged-attention" }
 vllm-scheduler       = { path = "../vllm-scheduler" }
 vllm-models          = { path = "../vllm-models" }
 candle-core = { workspace = true }
+candle-transformers = { workspace = true }
 anyhow    = { workspace = true }
 tokio     = { workspace = true }
 tracing   = { workspace = true }

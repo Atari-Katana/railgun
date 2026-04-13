@@ -13,7 +13,7 @@ use axum::{
 };
 use clap::Args;
 use futures::Stream;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::info;
 
 use vllm_core::{Device, DType};
@@ -45,7 +45,6 @@ pub struct ServeArgs {
 /// Shared application state.
 struct AppState {
     engine: Arc<RailgunEngine>,
-    tokenizer: Arc<RailgunTokenizer>,
 }
 
 /// OpenAI-compatible Chat Completion Request.
@@ -54,37 +53,12 @@ struct ChatCompletionRequest {
     #[allow(dead_code)]
     model: String,
     messages: Vec<ChatMessage>,
-    #[serde(default)]
-    stream: bool,
     max_tokens: Option<usize>,
     temperature: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-/// OpenAI-compatible Chat Completion Response (non-stream).
-#[derive(Debug, Serialize)]
-struct ChatCompletionResponse {
-    id: String,
-    object: String,
-    created: u64,
-    model: String,
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatChoice {
-    index: usize,
-    message: ChatMessageResponse,
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatMessageResponse {
     role: String,
     content: String,
 }
@@ -118,13 +92,12 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // 3. Start Engine
     let engine = RailgunEngine::new(
         model,
-        tokenizer.clone(), // This is actually cheap or we wrap in Arc
+        tokenizer,
         scheduler,
     );
 
     let state = Arc::new(AppState {
         engine,
-        tokenizer: Arc::new(tokenizer),
     });
 
     // 4. Setup Routes

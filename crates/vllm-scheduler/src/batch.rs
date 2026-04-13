@@ -84,12 +84,14 @@ mod tests {
             token_ids: vec![1, 2, 3, 4],
             position_start: 0,
             block_table: vec![],
+            sampling_params: SamplingParams::default(),
         });
         out.decode_slots.push(DecodeSlot {
             request_id: RequestId::new(),
             last_token_id: 99,
             seq_len: 10,
             block_table: vec![],
+            sampling_params: SamplingParams::default(),
         });
         assert_eq!(out.num_tokens(), 5); // 4 prefill + 1 decode
     }

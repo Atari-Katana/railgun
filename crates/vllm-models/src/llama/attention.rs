@@ -5,11 +5,9 @@
 //! contiguous KV cache tensor, it uses a block-based cache managed by 
 //! `vllm-paged-attention`.
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Result, Tensor, Module};
 use candle_nn::VarBuilder;
 use tracing::debug;
-
-use vllm_paged_attention::block::BlockId;
 
 /// PagedAttention Layer.
 /// 
@@ -28,10 +26,6 @@ pub struct PagedSelfAttention {
     num_kv_heads: usize,
     head_dim: usize,
     scale: f64,
-    
-    // RoPE cache
-    cos: Tensor,
-    sin: Tensor,
 }
 
 impl PagedSelfAttention {
@@ -42,10 +36,26 @@ impl PagedSelfAttention {
         let size_q = cfg.hidden_size;
         let size_kv = cfg.hidden_size / (cfg.num_attention_heads / cfg.num_key_value_heads);
         
-        let q_proj = candle_nn::linear(size_q, cfg.hidden_size, vb.pp("q_proj"))?;
-        let k_proj = candle_nn::linear(size_q, size_kv, vb.pp("k_proj"))?;
-        let v_proj = candle_nn::linear(size_q, size_kv, vb.pp("v_proj"))?;
-        let o_proj = candle_nn::linear(cfg.hidden_size, size_q, vb.pp("o_proj"))?;
+        let q_proj = if vb.contains_tensor("q_proj.bias") {
+            candle_nn::linear(size_q, cfg.hidden_size, vb.pp("q_proj"))?
+        } else {
+            candle_nn::linear_no_bias(size_q, cfg.hidden_size, vb.pp("q_proj"))?
+        };
+        let k_proj = if vb.contains_tensor("k_proj.bias") {
+            candle_nn::linear(size_q, size_kv, vb.pp("k_proj"))?
+        } else {
+            candle_nn::linear_no_bias(size_q, size_kv, vb.pp("k_proj"))?
+        };
+        let v_proj = if vb.contains_tensor("v_proj.bias") {
+            candle_nn::linear(size_q, size_kv, vb.pp("v_proj"))?
+        } else {
+            candle_nn::linear_no_bias(size_q, size_kv, vb.pp("v_proj"))?
+        };
+        let o_proj = if vb.contains_tensor("o_proj.bias") {
+            candle_nn::linear(cfg.hidden_size, size_q, vb.pp("o_proj"))?
+        } else {
+            candle_nn::linear_no_bias(cfg.hidden_size, size_q, vb.pp("o_proj"))?
+        };
         
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
         let scale = (head_dim as f64).powf(-0.5);
@@ -65,16 +75,25 @@ impl PagedSelfAttention {
     pub fn forward(
         &self,
         x: &Tensor,
-        block_table: &Tensor,     // [batch, max_blocks]
-        context_lens: &Tensor,    // [batch]
-        kv_cache: &mut vllm_paged_attention::block::BlockPool,
+        _block_table: &Tensor,     // [batch, max_blocks]
+        _context_lens: &Tensor,    // [batch]
+        _slot_mapping: &Tensor,   // [total_tokens]
+        _kv_cache: &mut vllm_paged_attention::block::BlockPool,
     ) -> Result<Tensor> {
-        let (b_sz, seq_len, _) = x.dims3()?;
-        
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
+        // If rank 2, we are in packed mode [total_tokens, hidden]
+        // If rank 3, we are in padded mode [batch, seq_len, hidden]
+        if x.rank() == 2 {
+            // Simplified return for now as we don't have the packed kernels fully tied in
+            // Phase 5 will implement the actual PagedAttention call here.
+            return self.o_proj.forward(&q); 
+        }
+
+        let (b_sz, seq_len, _) = x.dims3()?;
+        
         let mut _q = q.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
         let mut _k = k.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
         let mut _v = v.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
@@ -102,5 +121,13 @@ impl PagedSelfAttention {
         let y = att.matmul(&_v)?;
         let y = y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?;
         self.o_proj.forward(&y)
+    }
+
+    pub fn num_kv_heads(&self) -> usize {
+        self.num_kv_heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
     }
 }

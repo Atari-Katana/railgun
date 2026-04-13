@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use vllm_core::{Device as VllmDevice, Result as CoreResult, CoreError};
 
-use cudarc::driver::{CudaContext, LaunchConfig, CudaModule, CudaSlice, PushKernelArg};
+use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, CudaModule, CudaSlice, PushKernelArg};
+use candle_core::cuda_backend::cudarc::nvrtc::Ptx;
 
 const PAGED_ATTENTION_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention.ptx"));
 const ROPE_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.ptx"));
@@ -19,15 +20,18 @@ impl PagedAttentionKernels {
         let stream = candle_dev.cuda_stream();
         let context = stream.context();
 
+        let paged_attn_src = std::str::from_utf8(PAGED_ATTENTION_PTX).unwrap();
+        let rope_src = std::str::from_utf8(ROPE_PTX).unwrap();
+
         let paged_attn_module = context
-            .load_module(PAGED_ATTENTION_PTX.into())
+            .load_module(Ptx::from_src(paged_attn_src))
             .map_err(|e| CoreError::DeviceInit {
                 device: VllmDevice::Cuda(ordinal as u32),
                 reason: format!("Failed to load PagedAttention group: {e}"),
             })?;
 
         let rope_module = context
-            .load_module(ROPE_PTX.into())
+            .load_module(Ptx::from_src(rope_src))
             .map_err(|e| CoreError::DeviceInit {
                 device: VllmDevice::Cuda(ordinal as u32),
                 reason: format!("Failed to load RoPE group: {e}"),
@@ -63,7 +67,7 @@ impl PagedAttentionKernels {
         };
 
         let mut builder = stream.launch_builder(&func);
-        builder.arg(x).arg(cos_sin).arg(positions).arg(num_heads).arg(head_dim);
+        builder.arg(x).arg(cos_sin).arg(positions).arg(&num_heads).arg(&head_dim);
         builder.launch(cfg)
             .map_err(|e| CoreError::Tensor(format!("RoPE launch error: {e}")))?;
 
@@ -93,7 +97,7 @@ impl PagedAttentionKernels {
 
         let mut builder = stream.launch_builder(&func);
         builder.arg(k).arg(v).arg(k_cache).arg(v_cache).arg(slot_mapping)
-            .arg(num_kv_heads).arg(head_dim).arg(block_size);
+            .arg(&num_kv_heads).arg(&head_dim).arg(&block_size);
         builder.launch(cfg)
             .map_err(|e| CoreError::Tensor(format!("CUDA launch error: {e}")))?;
 
@@ -127,8 +131,8 @@ impl PagedAttentionKernels {
 
         let mut builder = stream.launch_builder(&func);
         builder.arg(query).arg(key_cache).arg(value_cache).arg(block_table).arg(context_lens)
-            .arg(output).arg(scale).arg(num_heads).arg(num_kv_heads).arg(head_dim)
-            .arg(block_size).arg(max_blocks_per_seq);
+            .arg(output).arg(&scale).arg(&num_heads).arg(&num_kv_heads).arg(&head_dim)
+            .arg(&block_size).arg(&max_blocks_per_seq);
         builder.launch(cfg)
             .map_err(|e| CoreError::Tensor(format!("CUDA launch error: {e}")))?;
 

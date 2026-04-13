@@ -1,7 +1,6 @@
 //! `railgun benchmark` — Measure throughput and latency.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -12,7 +11,7 @@ use tracing::info;
 use vllm_core::{Device, DType};
 use vllm_engine::RailgunEngine;
 use vllm_models::llama::model::LlamaModel;
-use vllm_models::RailgunTokenizer;
+use vllm_models::{RailgunTokenizer, CausalLM};
 use vllm_scheduler::{Scheduler, SchedulerConfig, SamplingParams};
 
 /// Arguments for the `benchmark` subcommand.
@@ -65,10 +64,9 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
         config.head_dim(),
     )?;
 
-    let engine = RailgunEngine::new(model, tokenizer, scheduler);
-
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
+        let engine = RailgunEngine::new(model, tokenizer, scheduler);
         let start = Instant::now();
         let mut futures = Vec::new();
 

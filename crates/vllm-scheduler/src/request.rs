@@ -124,8 +124,6 @@ pub struct Request {
     pub output_token_ids: Vec<u32>,
     /// KV cache state for this request.
     pub kv_cache: KVCache,
-    /// Monotonically increasing arrival sequence number for FIFO ordering.
-    pub(crate) seq_num: u64,
 }
 
 impl Request {
@@ -135,12 +133,11 @@ impl Request {
     ///
     /// * `prompt_token_ids` – Tokenised input. Must be non-empty.
     /// * `params` – Sampling configuration.
-    /// * `seq_num` – Arrival order (assigned by the scheduler).
     ///
     /// # Panics
     ///
     /// Panics if `prompt_token_ids` is empty.
-    pub fn new(prompt_token_ids: Vec<u32>, params: SamplingParams, seq_num: u64) -> Self {
+    pub fn new(prompt_token_ids: Vec<u32>, params: SamplingParams) -> Self {
         assert!(!prompt_token_ids.is_empty(), "prompt must be non-empty");
         Self {
             id: RequestId::new(),
@@ -149,7 +146,6 @@ impl Request {
             status: RequestStatus::Waiting,
             output_token_ids: Vec::new(),
             kv_cache: KVCache::new(),
-            seq_num,
         }
     }
 
@@ -214,7 +210,7 @@ mod tests {
             stop_token_ids: vec![2], // EOS
             ..Default::default()
         };
-        let mut req = Request::new(vec![1, 2, 3], params, 0);
+        let mut req = Request::new(vec![1, 2, 3], params);
         assert_eq!(req.prompt_len(), 3);
         assert_eq!(req.seq_len(), 3);
         assert_eq!(req.status, RequestStatus::Waiting);
@@ -234,7 +230,7 @@ mod tests {
             max_new_tokens: 2,
             ..Default::default()
         };
-        let mut req = Request::new(vec![1], params, 0);
+        let mut req = Request::new(vec![1], params);
         assert!(req.append_token(10).is_none());
         let reason = req.append_token(20).unwrap();
         assert_eq!(reason, FinishReason::MaxTokens);

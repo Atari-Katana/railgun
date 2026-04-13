@@ -10,7 +10,7 @@ use tracing::{info, error};
 
 use vllm_core::Result;
 use vllm_models::llama::model::LlamaModel;
-use vllm_models::RailgunTokenizer;
+use vllm_models::{RailgunTokenizer, CausalLM};
 use vllm_scheduler::{Scheduler, SamplingParams, SchedulerOutput, RequestId};
 use crate::sampling::Sampler;
 
@@ -50,7 +50,7 @@ impl RailgunEngine {
         
         // Start the background engine loop
         tokio::spawn(async move {
-            if let Err(e) = run_engine_loop(cmd_rx, model, tokenizer, scheduler).await {
+            if let Err(e) = run_engine_loop(cmd_rx, model, scheduler, tokenizer).await {
                 error!(error = %e, "Engine loop fatal error");
             }
         });
@@ -115,34 +115,49 @@ async fn run_engine_loop(
         }
 
         // Execute Model Step (Packed)
+        tracing::debug!(num_tokens = output.num_tokens(), "Executing model step");
         let step_results = execute_model_step(&mut model, &tokenizer, &output, &mut scheduler).await?;
-
+        
         let mut decode_tokens = Vec::new();
         let mut prefill_done = Vec::new();
 
-        for res in step_results {
+        for res in &step_results {
             if let Some(token_id) = res.token_id {
                 decode_tokens.push((res.request_id, token_id));
             }
             if res.is_prefill {
                 prefill_done.push(res.request_id);
             }
+        }
+        
+        // Update scheduler (this computes if requests are finished)
+        scheduler.update_from_output(&vllm_scheduler::StepOutput {
+            decode_tokens,
+            prefill_done,
+        });
 
+        // Send responses with CORRECT finish status
+        for mut res in step_results {
             if let Some(tx) = response_channels.get(&res.request_id) {
+                // Check if request finished in scheduler
+                if let Some(req) = scheduler.find_request(res.request_id) {
+                    if let vllm_scheduler::RequestStatus::Finished(reason) = &req.status {
+                        res.engine_res.is_finished = true;
+                        res.engine_res.finish_reason = Some(format!("{:?}", reason));
+                    }
+                }
+
+                tracing::debug!(request_id = %res.request_id, finished = res.engine_res.is_finished, "Sending response");
                 if tx.send(res.engine_res.clone()).is_err() {
                     scheduler.abort(res.request_id);
                     response_channels.remove(&res.request_id);
                 }
             }
+            
             if res.engine_res.is_finished {
                 response_channels.remove(&res.request_id);
             }
         }
-        
-        scheduler.update_from_output(&vllm_scheduler::StepOutput {
-            decode_tokens,
-            prefill_done,
-        });
 
         tokio::task::yield_now().await;
     }
@@ -197,11 +212,11 @@ async fn execute_model_step(
 
     let mut flat_block_table = Vec::with_capacity(num_requests * max_blocks);
     for p in &batch.prefill_chunks {
-        flat_block_table.extend_from_slice(&p.block_table);
+        for &bid in &p.block_table { flat_block_table.push(bid.0); }
         flat_block_table.extend(std::iter::repeat(0).take(max_blocks - p.block_table.len()));
     }
     for d in &batch.decode_slots {
-        flat_block_table.extend_from_slice(&d.block_table);
+        for &bid in &d.block_table { flat_block_table.push(bid.0); }
         flat_block_table.extend(std::iter::repeat(0).take(max_blocks - d.block_table.len()));
     }
     let block_table = candle_core::Tensor::new(flat_block_table, &device)?
@@ -219,7 +234,7 @@ async fn execute_model_step(
     // 3. Extract and Sample Logits
     // Each request gets its last token's logits
     let mut current_offset = 0;
-    for (i, p) in batch.prefill_chunks.iter().enumerate() {
+    for (_i, p) in batch.prefill_chunks.iter().enumerate() {
         let last_token_idx = current_offset + p.token_ids.len() - 1;
         let req_logits = logits.get(last_token_idx)?;
         

@@ -21,7 +21,9 @@
 use std::sync::Arc;
 
 use candle_core::CudaDevice;
-pub use cudarc::driver::CudaContext;
+use candle_core::backend::BackendDevice;
+pub use candle_core::cuda_backend::cudarc::driver::CudaContext;
+use candle_core::cuda_backend::cudarc::driver::result as cudarc_result;
 use thiserror::Error;
 use tracing::debug;
 
@@ -37,7 +39,7 @@ pub enum CudaError {
 
     /// A CUDA runtime operation failed.
     #[error("CUDA operation failed: {0}")]
-    Driver(#[from] cudarc::driver::DriverError),
+    Driver(#[from] candle_core::cuda_backend::cudarc::driver::DriverError),
     
     #[error("Candle error: {0}")]
     Candle(#[from] candle_core::Error),
@@ -60,7 +62,7 @@ impl RailgunCudaContext {
         let candle_dev = CudaDevice::new(ordinal as usize)?;
         
         let stream = candle_dev.cuda_stream();
-        let context = stream.context();
+        let _context = stream.context();
         
         let kernels = PagedAttentionKernels::new(&candle_dev, ordinal as usize)
             .map_err(|e| CudaError::Init { ordinal, source: candle_core::Error::Msg(e.to_string()) })?;
@@ -88,21 +90,16 @@ impl RailgunCudaContext {
         self.candle_dev.cuda_stream().context().clone()
     }
 
+    pub fn stream(&self) -> Arc<candle_core::cuda_backend::cudarc::driver::CudaStream> {
+        self.candle_dev.cuda_stream()
+    }
+
     pub fn synchronize(&self) -> CudaResult<()> {
         self.candle_dev.synchronize().map_err(CudaError::Candle)
     }
 
     pub fn memory_info(&self) -> CudaResult<(usize, usize)> {
-        // We still need a way to get memory info. CudaContext has it.
-        self.context().memory_info().map_err(CudaError::Driver)
-    }
-}
-
-impl std::fmt::Debug for CudaContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CudaContext")
-            .field("ordinal", &self.ordinal)
-            .finish_non_exhaustive()
+        cudarc_result::mem_get_info().map_err(CudaError::Driver)
     }
 }
 
@@ -111,10 +108,10 @@ mod tests {
     use super::*;
 
     /// This test is skipped automatically in CPU-only CI by checking whether
-    /// `CudaContext::new(0)` returns an error.
+    /// `RailgunCudaContext::new(0)` returns an error.
     #[test]
     fn create_context_or_skip() {
-        match CudaContext::new(0) {
+        match RailgunCudaContext::new(0) {
             Ok(ctx) => {
                 assert_eq!(ctx.ordinal(), 0);
                 ctx.synchronize().expect("synchronize failed");

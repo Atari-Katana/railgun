@@ -75,7 +75,6 @@ pub struct Scheduler {
     waiting: VecDeque<Request>,
     running: Vec<Request>,
     finished: Vec<Request>,
-    next_seq_num: u64,
 }
 
 impl Scheduler {
@@ -115,31 +114,18 @@ impl Scheduler {
             waiting: VecDeque::new(),
             running: Vec::new(),
             finished: Vec::new(),
-            next_seq_num: 0,
         })
     }
 
     /// Add an incoming request to the waiting queue.
     pub fn add_request(&mut self, prompt_token_ids: Vec<u32>, params: SamplingParams) -> RequestId {
-        let seq_num = self.next_seq_num;
-        self.next_seq_num += 1;
-        let req = Request::new(prompt_token_ids, params, seq_num);
+        let req = Request::new(prompt_token_ids, params);
         let id = req.id;
         debug!(request_id = %id, "enqueued");
         self.waiting.push_back(req);
         id
     }
 
-    /// Abort a request by ID. No-op if the ID is not found.
-    pub fn abort(&mut self, id: RequestId) {
-        self.waiting.retain(|r| r.id != id);
-        if let Some(pos) = self.running.iter().position(|r| r.id == id) {
-            let mut req = self.running.remove(pos);
-            self.free_kv_blocks(&mut req);
-            req.status = RequestStatus::Finished(FinishReason::Cancelled);
-            self.finished.push(req);
-        }
-    }
 
     /// Compute and return the batch to execute this step.
     ///
@@ -184,9 +170,11 @@ impl Scheduler {
             let token_ids: Vec<u32> = req.prompt_token_ids[..chunk_size].to_vec();
             let block_table = req.kv_cache.as_block_ids().to_vec();
 
+            let num_processed = req.num_processed();
+            
             if chunk_size < req.prompt_len() {
                 req.status = RequestStatus::Prefilling {
-                    next_chunk_start: chunk_size,
+                    next_chunk_start: num_processed + chunk_size,
                 };
             } else {
                 req.status = RequestStatus::Prefilling {
@@ -194,7 +182,6 @@ impl Scheduler {
                 };
             }
 
-            let num_processed = req.num_processed();
             for (i, _) in token_ids.iter().enumerate() {
                 let block_idx = (num_processed + i) / self.config.block_size;
                 let token_idx = (num_processed + i) % self.config.block_size;
@@ -298,11 +285,40 @@ impl Scheduler {
         // Remove finished requests (in reverse order to keep indices valid)
         done_ids.sort_unstable();
         done_ids.dedup();
-        for idx in done_ids.into_iter().rev() {
+        for &idx in done_ids.iter().rev() {
             let mut req = self.running.remove(idx);
             self.free_kv_blocks(&mut req);
             self.finished.push(req);
         }
+    }
+
+    /// Abort a request proactively (e.g. client disconnected).
+    pub fn abort(&mut self, id: RequestId) {
+        if let Some(pos) = self.running.iter().position(|r| r.id == id) {
+            let mut req = self.running.remove(pos);
+            self.free_kv_blocks(&mut req);
+            req.status = RequestStatus::Finished(FinishReason::Cancelled);
+            self.finished.push(req);
+        } else if let Some(pos) = self.waiting.iter().position(|r| r.id == id) {
+            let mut req = self.waiting.remove(pos).unwrap();
+            req.status = RequestStatus::Finished(FinishReason::Cancelled);
+            self.finished.push(req);
+        }
+    }
+
+    /// Returns a reference to an active request.
+    pub fn find_request(&self, id: RequestId) -> Option<&Request> {
+        self.running
+            .iter()
+            .find(|r| r.id == id)
+            .or_else(|| self.waiting.iter().find(|r| r.id == id))
+            .or_else(|| self.finished.iter().find(|r| r.id == id))
+    }
+
+
+    /// Take all finished requests.
+    pub fn drain_finished(&mut self) -> Vec<Request> {
+        std::mem::take(&mut self.finished)
     }
 
     /// Return all KV cache blocks held by a request.

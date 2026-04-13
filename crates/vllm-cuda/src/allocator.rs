@@ -20,30 +20,30 @@
 //! all primitive numeric types (`f32`, `f16`, `u32`, `i32`, …).
 
 use std::sync::Arc;
-use cudarc::driver::{CudaSlice, CudaViewMut, DeviceRepr};
-use super::context::{CudaError, CudaResult, CudaContext};
+use candle_core::cuda_backend::cudarc::driver::{CudaSlice, CudaViewMut, DeviceRepr, CudaStream};
+use super::context::{CudaError, CudaResult};
 
 /// An owned buffer of `T` residing in CUDA device memory.
 pub struct DeviceBuffer<T: DeviceRepr> {
     slice: CudaSlice<T>,
-    device: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
     len: usize,
 }
 
 impl<T: DeviceRepr + 'static> DeviceBuffer<T> {
-    pub fn alloc(len: usize, device: Arc<CudaContext>) -> CudaResult<Self> {
-        let slice = unsafe { device.alloc::<T>(len) }.map_err(CudaError::Driver)?;
-        Ok(Self { slice, device, len })
+    pub fn alloc(len: usize, stream: Arc<CudaStream>) -> CudaResult<Self> {
+        let slice = unsafe { stream.alloc::<T>(len) }.map_err(CudaError::Driver)?;
+        Ok(Self { slice, stream, len })
     }
 
-    pub fn zeros(len: usize, device: Arc<CudaContext>) -> CudaResult<Self>
+    pub fn zeros(len: usize, stream: Arc<CudaStream>) -> CudaResult<Self>
     where
-        T: cudarc::driver::ValidAsZeroBits,
+        T: candle_core::cuda_backend::cudarc::driver::ValidAsZeroBits,
     {
-        let slice = device.alloc_zeros::<T>(len).map_err(CudaError::Driver)?;
+        let slice = stream.alloc_zeros::<T>(len).map_err(CudaError::Driver)?;
         Ok(Self {
             slice,
-            device,
+            stream,
             len,
         })
     }
@@ -81,9 +81,10 @@ impl<T: DeviceRepr + 'static> DeviceBuffer<T> {
             len = data.len(),
             buf = self.len
         );
-        self.device
-            .htod_sync_copy_into(data, &mut self.slice)
-            .map_err(CudaError::Driver)
+        self.stream
+            .memcpy_htod(data, &mut self.slice)
+            .map_err(CudaError::Driver)?;
+        self.stream.synchronize().map_err(CudaError::Driver)
     }
 
     /// Copy this buffer to a host `Vec<T>`.
@@ -95,15 +96,18 @@ impl<T: DeviceRepr + 'static> DeviceBuffer<T> {
     /// Returns [`CudaError::Driver`] on transfer failure.
     pub fn copy_to_host(&self) -> CudaResult<Vec<T>>
     where
-        T: Clone,
+        T: Clone + Default,
     {
-        self.device
-            .dtoh_sync_copy(&self.slice)
-            .map_err(CudaError::Driver)
+        let mut data = vec![T::default(); self.len];
+        self.stream
+            .memcpy_dtoh(&self.slice, &mut data)
+            .map_err(CudaError::Driver)?;
+        self.stream.synchronize().map_err(CudaError::Driver)?;
+        Ok(data)
     }
 
     /// Returns a mutable view for use in cudarc kernel launches.
-    pub fn as_view_mut(&mut self) -> CudaViewMut<T> {
+    pub fn as_view_mut(&mut self) -> CudaViewMut<'_, T> {
         self.slice.slice_mut(..)
     }
 }
@@ -117,11 +121,11 @@ impl<T: DeviceRepr> std::fmt::Debug for DeviceBuffer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CudaContext;
+    use crate::context::RailgunCudaContext;
 
     #[test]
     fn alloc_and_round_trip_or_skip() {
-        let ctx = match CudaContext::new(0) {
+        let ctx = match RailgunCudaContext::new(0) {
             Ok(c) => c,
             Err(_) => {
                 println!("Skipping DeviceBuffer test (no GPU)");
@@ -130,7 +134,7 @@ mod tests {
         };
 
         let host_data: Vec<f32> = (0..1024).map(|i| i as f32).collect();
-        let mut buf = DeviceBuffer::<f32>::alloc(1024, ctx.device()).unwrap();
+        let mut buf = DeviceBuffer::<f32>::alloc(1024, ctx.stream()).unwrap();
         buf.copy_from_host(&host_data).unwrap();
         let back = buf.copy_to_host().unwrap();
         assert_eq!(back, host_data);
@@ -138,12 +142,12 @@ mod tests {
 
     #[test]
     fn zeros_are_zero_or_skip() {
-        let ctx = match CudaContext::new(0) {
+        let ctx = match RailgunCudaContext::new(0) {
             Ok(c) => c,
             Err(_) => return,
         };
 
-        let buf = DeviceBuffer::<i32>::zeros(256, ctx.device()).unwrap();
+        let buf = DeviceBuffer::<i32>::zeros(256, ctx.stream()).unwrap();
         let back = buf.copy_to_host().unwrap();
         assert!(back.iter().all(|&v| v == 0));
     }

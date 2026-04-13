@@ -2632,7 +2632,6 @@ name = "vllm-cuda"
 version = "0.1.0"
 dependencies = [
  "candle-core",
- "cudarc 0.19.4",
  "thiserror 2.0.18",
  "tracing",
  "vllm-core",
@@ -2644,6 +2643,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
+ "candle-transformers",
  "flume",
  "serde",
  "serde_json",
