@@ -49,6 +49,7 @@ impl PagedAttentionOp {
         v_cache: &Tensor,
         block_table: &Tensor,
         context_lens: &Tensor,
+        max_context_len: usize,
     ) -> Result<Tensor> {
         let _device = q.device();
         let (batch_size, num_heads, head_dim) = q.dims3()?;
@@ -73,8 +74,6 @@ impl PagedAttentionOp {
                 let out_shape = Shape::from((batch_size, num_heads, head_dim));
                 let out_size = out_shape.elem_count();
                 let mut out_cuda = dev.alloc_zeros::<f32>(out_size).map_err(candle_core::Error::from)?;
-
-                let max_context_len = context_lens.to_vec1::<i32>()?.into_iter().max().unwrap_or(0);
 
                 if max_context_len <= 4096 {
                     unsafe {
@@ -127,7 +126,7 @@ impl PagedAttentionOp {
                             head_dim as i32,
                             block_size as i32,
                             max_blocks as i32,
-                            num_partitions,
+                            num_partitions as i32,
                             batch_size as i32,
                         ).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
@@ -139,7 +138,7 @@ impl PagedAttentionOp {
                             cl_cuda.as_cuda_slice::<i32>()?,
                             num_heads as i32,
                             head_dim as i32,
-                            num_partitions,
+                            num_partitions as i32,
                             batch_size as i32,
                         ).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
                     }

@@ -169,6 +169,7 @@ impl LlamaModel {
             &context_lens,
             &slot_mapping_t,
             &mut pool,
+            num_tokens,
         )?;
 
         // Return last token's logits

@@ -200,13 +200,17 @@ async fn execute_model_step(
     // Context lens and Block table (Padded for batching)
     let mut context_lens_vec = Vec::with_capacity(num_requests);
     let mut max_blocks = 0;
+    let mut max_context_len = 0;
     for p in &batch.prefill_chunks {
-        context_lens_vec.push((p.position_start + p.token_ids.len()) as i32);
+        let seq_len = p.position_start + p.token_ids.len();
+        context_lens_vec.push(seq_len as i32);
         max_blocks = max_blocks.max(p.block_table.len());
+        max_context_len = max_context_len.max(seq_len);
     }
     for d in &batch.decode_slots {
         context_lens_vec.push(d.seq_len as i32);
         max_blocks = max_blocks.max(d.block_table.len());
+        max_context_len = max_context_len.max(d.seq_len);
     }
     let context_lens = candle_core::Tensor::new(context_lens_vec, &device)?;
 
@@ -229,6 +233,7 @@ async fn execute_model_step(
         &context_lens,
         &slot_mapping,
         scheduler.block_pool_mut(),
+        max_context_len,
     )?;
 
     // 3. Extract and Sample Logits

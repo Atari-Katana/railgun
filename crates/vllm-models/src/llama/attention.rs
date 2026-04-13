@@ -79,6 +79,7 @@ impl PagedSelfAttention {
         _context_lens: &Tensor,    // [batch]
         _slot_mapping: &Tensor,   // [total_tokens]
         _kv_cache: &mut vllm_paged_attention::block::BlockPool,
+        _max_context_len: usize,
     ) -> Result<Tensor> {
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;

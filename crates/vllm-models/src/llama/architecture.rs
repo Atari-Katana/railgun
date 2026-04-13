@@ -36,13 +36,14 @@ impl LlamaLayer {
         context_lens: &Tensor,
         _slot_mapping: &Tensor,
         kv_cache: &mut vllm_paged_attention::block::BlockPool,
+        max_context_len: usize,
     ) -> Result<Tensor> {
         let residual = x;
         let x = self.attention_norm.forward(x)?;
         
         // Paged attention step
         // In Phase 5, this will call the custom kernel via PagedAttentionOp
-        let x = self.attention.forward(&x, block_table, context_lens, _slot_mapping, kv_cache)?;
+        let x = self.attention.forward(&x, block_table, context_lens, _slot_mapping, kv_cache, max_context_len)?;
         let x = (x + residual)?;
         
         let residual = &x;
@@ -122,7 +123,7 @@ impl RailgunLlama {
         let (_b_sz, seq_len) = tokens.dims2()?;
         let mut x = self.embed_tokens.forward(tokens)?;
         for layer in &self.layers {
-            x = layer.forward(&x, block_table, context_lens, slot_mapping, kv_cache)?;
+            x = layer.forward(&x, block_table, context_lens, slot_mapping, kv_cache, seq_len)?;
         }
         x = self.norm.forward(&x)?;
         let last_token = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
@@ -136,10 +137,11 @@ impl RailgunLlama {
         context_lens: &Tensor,
         slot_mapping: &Tensor,
         kv_cache: &mut vllm_paged_attention::block::BlockPool,
+        max_context_len: usize,
     ) -> Result<Tensor> {
         let mut x = self.embed_tokens.forward(input_ids)?;
         for layer in &self.layers {
-            x = layer.forward(&x, block_table, context_lens, slot_mapping, kv_cache)?;
+            x = layer.forward(&x, block_table, context_lens, slot_mapping, kv_cache, max_context_len)?;
         }
         x = self.norm.forward(&x)?;
         self.lm_head.forward(&x)
