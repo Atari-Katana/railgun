@@ -110,6 +110,16 @@ impl<T: DeviceRepr + 'static> DeviceBuffer<T> {
     pub fn as_view_mut(&mut self) -> CudaViewMut<'_, T> {
         self.slice.slice_mut(..)
     }
+
+    /// Returns a reference to the underlying CudaSlice.
+    pub fn as_slice(&self) -> &CudaSlice<T> {
+        &self.slice
+    }
+
+    /// Returns a mutable reference to the underlying CudaSlice.
+    pub fn as_slice_mut(&mut self) -> &mut CudaSlice<T> {
+        &mut self.slice
+    }
 }
 
 impl<T: DeviceRepr> std::fmt::Debug for DeviceBuffer<T> {

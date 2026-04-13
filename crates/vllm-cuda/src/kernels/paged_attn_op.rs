@@ -6,6 +6,7 @@
 
 use candle_core::{CudaStorage, Layout, Result, Shape, Tensor, CpuStorage};
 use crate::kernels::PagedAttentionKernels;
+use crate::allocator::DeviceBuffer;
 
 /// The PagedAttention Custom Operation.
 pub struct PagedAttentionOp {
@@ -73,22 +74,75 @@ impl PagedAttentionOp {
                 let out_size = out_shape.elem_count();
                 let mut out_cuda = dev.alloc_zeros::<f32>(out_size).map_err(candle_core::Error::from)?;
 
-                unsafe {
-                    self.kernels.launch_v1(
-                        q_cuda.as_cuda_slice::<f32>()?,
-                        k_cuda.as_cuda_slice::<f32>()?,
-                        v_cuda.as_cuda_slice::<f32>()?,
-                        bt_cuda.as_cuda_slice::<i32>()?,
-                        cl_cuda.as_cuda_slice::<i32>()?,
-                        &mut out_cuda,
-                        self.scale,
-                        num_heads as i32,
-                        self.num_kv_heads as i32,
-                        head_dim as i32,
-                        block_size as i32,
-                        max_blocks as i32,
-                        batch_size as i32,
-                    ).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                let max_context_len = context_lens.to_vec1::<i32>()?.into_iter().max().unwrap_or(0);
+
+                if max_context_len <= 4096 {
+                    unsafe {
+                        self.kernels.launch_v1_plus(
+                            q_cuda.as_cuda_slice::<f32>()?,
+                            k_cuda.as_cuda_slice::<f32>()?,
+                            v_cuda.as_cuda_slice::<f32>()?,
+                            bt_cuda.as_cuda_slice::<i32>()?,
+                            cl_cuda.as_cuda_slice::<i32>()?,
+                            &mut out_cuda,
+                            self.scale,
+                            num_heads as i32,
+                            self.num_kv_heads as i32,
+                            head_dim as i32,
+                            block_size as i32,
+                            max_blocks as i32,
+                            batch_size as i32,
+                        ).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                    }
+                } else {
+                    // PagedAttention V2 Hybrid Dispatch
+                    let num_partitions = (max_context_len + 255) / 256;
+                    let num_parts = num_partitions as usize;
+                    
+                    let tmp_out_size = batch_size * num_heads * num_parts * head_dim;
+                    let exp_sums_size = batch_size * num_heads * num_parts;
+                    let max_logits_size = batch_size * num_heads * num_parts;
+
+                    let stream = dev.cuda_stream().clone();
+                    let mut tmp_out = DeviceBuffer::<f32>::zeros(tmp_out_size, stream.clone())
+                        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                    let mut exp_sums = DeviceBuffer::<f32>::zeros(exp_sums_size, stream.clone())
+                        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                    let mut max_logits = DeviceBuffer::<f32>::zeros(max_logits_size, stream)
+                        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+                    unsafe {
+                        self.kernels.launch_v2_partition(
+                            q_cuda.as_cuda_slice::<f32>()?,
+                            k_cuda.as_cuda_slice::<f32>()?,
+                            v_cuda.as_cuda_slice::<f32>()?,
+                            bt_cuda.as_cuda_slice::<i32>()?,
+                            cl_cuda.as_cuda_slice::<i32>()?,
+                            tmp_out.as_slice_mut(),
+                            exp_sums.as_slice_mut(),
+                            max_logits.as_slice_mut(),
+                            self.scale,
+                            num_heads as i32,
+                            self.num_kv_heads as i32,
+                            head_dim as i32,
+                            block_size as i32,
+                            max_blocks as i32,
+                            num_partitions,
+                            batch_size as i32,
+                        ).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+                        self.kernels.launch_v2_reduce(
+                            &mut out_cuda,
+                            exp_sums.as_slice(),
+                            max_logits.as_slice(),
+                            tmp_out.as_slice(),
+                            cl_cuda.as_cuda_slice::<i32>()?,
+                            num_heads as i32,
+                            head_dim as i32,
+                            num_partitions,
+                            batch_size as i32,
+                        ).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                    }
                 }
 
                 let new_storage = candle_core::CudaStorage::wrap_cuda_slice(out_cuda, dev.clone());
