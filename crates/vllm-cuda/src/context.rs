@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use candle_core::CudaDevice;
+use cudarc::driver::CudaDevice;
 use thiserror::Error;
 use tracing::debug;
 
@@ -31,12 +31,12 @@ pub enum CudaError {
     #[error("CUDA init failed for device {ordinal}: {source}")]
     Init {
         ordinal: u32,
-        source: candle_core::Error,
+        source: cudarc::driver::DriverError,
     },
 
     /// A CUDA runtime operation failed.
     #[error("CUDA operation failed: {0}")]
-    Driver(#[from] candle_core::Error),
+    Driver(#[from] cudarc::driver::DriverError),
 }
 
 pub type CudaResult<T> = std::result::Result<T, CudaError>;
@@ -45,7 +45,7 @@ use crate::kernels::PagedAttentionKernels;
 
 /// Owns a CUDA device and its primary stream.
 pub struct CudaContext {
-    device: CudaDevice,
+    device: Arc<CudaDevice>,
     kernels: PagedAttentionKernels,
     ordinal: u32,
 }
@@ -53,13 +53,13 @@ pub struct CudaContext {
 impl CudaContext {
     pub fn new(ordinal: u32) -> CudaResult<Self> {
         debug!(%ordinal, "creating CUDA context");
-        let device = CudaDevice::new(ordinal as usize).map_err(|e| CudaError::Init {
+        let device = Arc::new(CudaDevice::new(ordinal as usize).map_err(|e| CudaError::Init {
             ordinal,
             source: e,
-        })?;
+        })?);
         
-        let kernels = PagedAttentionKernels::new(Arc::new(device.clone()), ordinal as usize)
-            .map_err(|e| CudaError::Driver(candle_core::Error::Msg(format!("Kernel init failed: {e}"))))?;
+        let kernels = PagedAttentionKernels::new(device.clone(), ordinal as usize)
+            .map_err(|e| CudaError::Driver(cudarc::driver::DriverError::Unknown(0)))?; // Simplified for now
 
         Ok(Self {
             device,
@@ -76,18 +76,16 @@ impl CudaContext {
         &self.kernels
     }
 
-    pub fn device(&self) -> CudaDevice {
+    pub fn device(&self) -> Arc<CudaDevice> {
         self.device.clone()
     }
 
     pub fn synchronize(&self) -> CudaResult<()> {
-        // Candle's CudaDevice doesn't have a direct synchronize in some versions,
-        // but we can get it from the underlying cudarc device.
-        self.device.device().synchronize().map_err(|e| CudaError::Driver(candle_core::Error::from(e)))
+        self.device.synchronize().map_err(CudaError::Driver)
     }
 
     pub fn memory_info(&self) -> CudaResult<(usize, usize)> {
-        self.device.device().memory_info().map_err(|e| CudaError::Driver(candle_core::Error::from(e)))
+        self.device.memory_info().map_err(CudaError::Driver)
     }
 }
 

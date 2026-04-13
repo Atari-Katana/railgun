@@ -40,6 +40,10 @@ impl PagedAttentionKernels {
         Ok(Self { device })
     }
 
+    pub fn device(&self) -> &Arc<CudaDevice> {
+        &self.device
+    }
+
     /// Launch the RoPE kernel.
     pub unsafe fn launch_rope(
         &self,

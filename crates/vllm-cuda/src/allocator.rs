@@ -19,31 +19,29 @@
 //! that are safe to store in GPU memory as flat bytes). The blanket impls cover
 //! all primitive numeric types (`f32`, `f16`, `u32`, `i32`, …).
 
-use candle_core::CudaDevice;
-use cudarc::driver::{CudaSlice, CudaViewMut, DeviceRepr};
+use std::sync::Arc;
+use cudarc::driver::{CudaDevice, CudaSlice, CudaViewMut, DeviceRepr};
 
 use super::context::{CudaError, CudaResult};
 
 /// An owned buffer of `T` residing in CUDA device memory.
 pub struct DeviceBuffer<T: DeviceRepr> {
     slice: CudaSlice<T>,
-    device: CudaDevice,
+    device: Arc<CudaDevice>,
     len: usize,
 }
 
 impl<T: DeviceRepr + 'static> DeviceBuffer<T> {
-    pub fn alloc(len: usize, device: CudaDevice) -> CudaResult<Self> {
-        let slice = unsafe { device.device().alloc::<T>(len) }
-            .map_err(|e| CudaError::Driver(candle_core::Error::from(e)))?;
+    pub fn alloc(len: usize, device: Arc<CudaDevice>) -> CudaResult<Self> {
+        let slice = unsafe { device.alloc::<T>(len) }.map_err(CudaError::Driver)?;
         Ok(Self { slice, device, len })
     }
 
-    pub fn zeros(len: usize, device: CudaDevice) -> CudaResult<Self>
+    pub fn zeros(len: usize, device: Arc<CudaDevice>) -> CudaResult<Self>
     where
         T: cudarc::driver::ValidAsZeroBits,
     {
-        let slice = device.device().alloc_zeros::<T>(len)
-            .map_err(|e| CudaError::Driver(candle_core::Error::from(e)))?;
+        let slice = device.alloc_zeros::<T>(len).map_err(CudaError::Driver)?;
         Ok(Self {
             slice,
             device,
@@ -84,9 +82,9 @@ impl<T: DeviceRepr + 'static> DeviceBuffer<T> {
             len = data.len(),
             buf = self.len
         );
-        self.device.device()
+        self.device
             .htod_sync_copy_into(data, &mut self.slice)
-            .map_err(|e| CudaError::Driver(candle_core::Error::from(e)))
+            .map_err(CudaError::Driver)
     }
 
     /// Copy this buffer to a host `Vec<T>`.
@@ -100,9 +98,9 @@ impl<T: DeviceRepr + 'static> DeviceBuffer<T> {
     where
         T: Clone,
     {
-        self.device.device()
+        self.device
             .dtoh_sync_copy(&self.slice)
-            .map_err(|e| CudaError::Driver(candle_core::Error::from(e)))
+            .map_err(CudaError::Driver)
     }
 
     /// Returns a mutable view for use in cudarc kernel launches.
