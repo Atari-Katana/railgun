@@ -7,7 +7,10 @@
 
 use candle_core::{Result, Tensor, Module};
 use candle_nn::VarBuilder;
-use tracing::debug;
+use std::sync::Arc;
+
+#[cfg(feature = "cuda")]
+use vllm_cuda::kernels::PagedAttentionKernels;
 
 /// PagedAttention Layer.
 /// 
@@ -26,12 +29,17 @@ pub struct PagedSelfAttention {
     num_kv_heads: usize,
     head_dim: usize,
     scale: f64,
+
+    #[cfg(feature = "cuda")]
+    kernels: Option<Arc<PagedAttentionKernels>>,
 }
 
 impl PagedSelfAttention {
     pub fn load(
         vb: VarBuilder,
         cfg: &candle_transformers::models::llama::Config,
+        #[cfg(feature = "cuda")]
+        kernels: Option<Arc<PagedAttentionKernels>>,
     ) -> Result<Self> {
         let size_q = cfg.hidden_size;
         let size_kv = cfg.hidden_size / (cfg.num_attention_heads / cfg.num_key_value_heads);
@@ -69,54 +77,73 @@ impl PagedSelfAttention {
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
             scale,
+            #[cfg(feature = "cuda")]
+            kernels,
         })
     }
 
     pub fn forward(
         &self,
         x: &Tensor,
-        _block_table: &Tensor,     // [batch, max_blocks]
-        _context_lens: &Tensor,    // [batch]
-        _slot_mapping: &Tensor,   // [total_tokens]
-        _kv_cache: &mut vllm_paged_attention::block::BlockPool,
-        _max_context_len: usize,
+        block_table: &Tensor,     // [batch, max_blocks]
+        context_lens: &Tensor,    // [batch]
+        slot_mapping: &Tensor,   // [total_tokens]
+        kv_cache: &mut vllm_paged_attention::block::GpuBlockPool,
+        max_context_len: usize,
     ) -> Result<Tensor> {
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        // If rank 2, we are in packed mode [total_tokens, hidden]
-        // If rank 3, we are in padded mode [batch, seq_len, hidden]
+        let total_tokens = match x.rank() {
+            2 => x.dim(0)?,
+            3 => x.dim(0)? * x.dim(1)?,
+            _ => return Err(candle_core::Error::Msg("Unsupported rank for input tensor".to_string())),
+        };
+
+        #[cfg(feature = "cuda")]
+        if let Some(kernels) = &self.kernels {
+            let mut k_cache = kv_cache.k_cache()?;
+            let mut v_cache = kv_cache.v_cache()?;
+            
+            let op = vllm_cuda::kernels::PagedAttentionOp {
+                scale: self.scale as f32,
+                num_heads: self.num_heads,
+                num_kv_heads: self.num_kv_heads,
+                head_dim: self.head_dim,
+                block_size: kv_cache.block_size,
+                kernels: kernels.clone(),
+            };
+
+            // Reshape K/V for the kernel: [total_tokens, num_kv_heads, head_dim]
+            let k_reshaped = k.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
+            let v_reshaped = v.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
+
+            // 1. Store K/V into Paged Cache
+            op.reshape_and_cache(&k_reshaped, &v_reshaped, &mut k_cache, &mut v_cache, slot_mapping)?;
+
+            // 2. Compute Attention
+            if x.rank() == 2 {
+                // PACKED/DECODE PATH
+                let q_reshaped = q.reshape((total_tokens, self.num_heads, self.head_dim))?;
+                let out = op.execute(&q_reshaped, &k_cache, &v_cache, block_table, context_lens, max_context_len)?;
+                return self.o_proj.forward(&out.reshape((total_tokens, ()))?);
+            }
+        }
+
+        // FALLBACK PATH (or rank 3 / CPU)
         if x.rank() == 2 {
-            // Simplified return for now as we don't have the packed kernels fully tied in
-            // Phase 5 will implement the actual PagedAttention call here.
+            // If we are here in packed mode, it means CUDA kernels are missing or not enabled.
+            // This is currently unsupported for production high-throughput serving.
             return self.o_proj.forward(&q); 
         }
 
         let (b_sz, seq_len, _) = x.dims3()?;
         
-        let mut _q = q.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
-        let mut _k = k.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
-        let mut _v = v.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
+        let _q = q.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+        let _k = k.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
+        let _v = v.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
 
-        // Apply RoPE
-        // _q = apply_rope(&_q, ...)?;
-        // _k = apply_rope(&_k, ...)?;
-        
-        if seq_len == 1 && x.device().is_cuda() {
-            // DECODE PATH: Use PagedAttention CUDA kernel
-            // In a real implementation we would have the PagedAttentionOp ready here.
-            // For now, we still use the fallback but we recognize where the kernel goes.
-            debug!("Using paged attention CUDA kernel (placeholder)");
-        }
-
-        // 1. Store K/V into Paged Cache
-        // reshape_and_cache(k, v, kv_cache, block_table, context_lens);
-
-        // 2. Compute Attention
-        // For prefill, use FlashAttention or fallback.
-        // For decode, use PagedAttention kernel.
-        
         let att = (_q.matmul(&_k.transpose(2, 3)?)? * self.scale)?;
         let att = candle_nn::ops::softmax(&att, candle_core::D::Minus1)?;
         let y = att.matmul(&_v)?;

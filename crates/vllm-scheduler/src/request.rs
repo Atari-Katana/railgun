@@ -99,6 +99,8 @@ pub enum RequestStatus {
     Prefilling { next_chunk_start: usize },
     /// Prompt has been processed; generating one new token per step.
     Decoding,
+    /// KV cache blocks have been moved to host memory to free GPU space.
+    Swapped,
     /// Generation is complete.
     Finished(FinishReason),
 }
@@ -164,7 +166,9 @@ impl Request {
         match self.status {
             RequestStatus::Waiting => 0,
             RequestStatus::Prefilling { next_chunk_start } => next_chunk_start,
-            RequestStatus::Decoding => self.prompt_len() + self.output_token_ids.len(),
+            RequestStatus::Decoding | RequestStatus::Swapped => {
+                self.prompt_len() + self.output_token_ids.len()
+            }
             RequestStatus::Finished(_) => self.seq_len(),
         }
     }

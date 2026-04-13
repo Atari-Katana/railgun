@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use vllm_paged_attention::allocator::BlockAllocator;
-use vllm_paged_attention::block::BlockPool;
+use vllm_paged_attention::block::{GpuBlockPool, CpuBlockPool};
 
 use super::batch::{DecodeSlot, PrefillChunk, SchedulerOutput};
 use super::request::{FinishReason, Request, RequestId, RequestStatus, SamplingParams};
@@ -36,8 +36,10 @@ pub struct SchedulerConfig {
     pub max_num_seqs: usize,
     /// KV cache block size (tokens per block).
     pub block_size: usize,
-    /// Total KV cache blocks available.
+    /// Total KV cache blocks available on GPU.
     pub num_gpu_blocks: usize,
+    /// Total KV cache blocks available on CPU (host memory).
+    pub num_cpu_blocks: usize,
     /// Maximum sequence length (prompt + generation).
     pub max_model_len: usize,
 }
@@ -49,6 +51,7 @@ impl Default for SchedulerConfig {
             max_num_seqs: 256,
             block_size: 16,
             num_gpu_blocks: 1000,
+            num_cpu_blocks: 512,
             max_model_len: 4096,
         }
     }
@@ -74,19 +77,12 @@ pub struct Scheduler {
     allocator: BlockAllocator,
     waiting: VecDeque<Request>,
     running: Vec<Request>,
+    swapped: VecDeque<Request>,
     finished: Vec<Request>,
 }
 
 impl Scheduler {
     /// Create a new scheduler.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` – Scheduler configuration.
-    /// * `device` – The GPU device (used to allocate the KV pool).
-    /// * `kv_dtype` – dtype for KV tensors (typically BF16).
-    /// * `num_kv_heads` – Number of KV attention head groups in the model.
-    /// * `head_dim` – Attention head dimension.
     pub fn new(
         config: SchedulerConfig,
         device: Device,
@@ -94,7 +90,7 @@ impl Scheduler {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> vllm_core::Result<Self> {
-        let pool = BlockPool::new(
+        let gpu_pool = GpuBlockPool::new(
             config.num_gpu_blocks,
             config.block_size,
             num_kv_heads,
@@ -102,17 +98,26 @@ impl Scheduler {
             kv_dtype,
             device,
         )?;
-        let allocator = BlockAllocator::new(Arc::new(pool));
+        let cpu_pool = CpuBlockPool::new(
+            config.num_cpu_blocks,
+            config.block_size,
+            num_kv_heads,
+            head_dim,
+            kv_dtype,
+        )?;
+        let allocator = BlockAllocator::new(Arc::new(gpu_pool), Arc::new(cpu_pool));
         info!(
-            num_blocks = config.num_gpu_blocks,
+            gpu_blocks = config.num_gpu_blocks,
+            cpu_blocks = config.num_cpu_blocks,
             block_size = config.block_size,
-            "scheduler KV cache initialised"
+            "scheduler KV cache initialised with host swapping"
         );
         Ok(Self {
             config,
             allocator,
             waiting: VecDeque::new(),
             running: Vec::new(),
+            swapped: VecDeque::new(),
             finished: Vec::new(),
         })
     }
@@ -135,7 +140,47 @@ impl Scheduler {
         let mut out = SchedulerOutput::default();
         let mut token_budget = self.config.max_num_batched_tokens;
 
-        // ── 1. Try to promote waiting requests ─────────────────────────────
+        // ── 1. Try to swap in requests from host ───────────────────────────
+        while let Some(req) = self.swapped.front() {
+            if self.running.len() >= self.config.max_num_seqs {
+                break;
+            }
+            let blocks_needed = req.kv_cache.num_blocks();
+            if self.allocator.num_free_gpu() < blocks_needed {
+                break;
+            }
+
+            let mut req = self.swapped.pop_front().unwrap();
+            let gpu_blocks = self.allocator.swap_in(req.kv_cache.as_block_ids()).expect("swap_in failed");
+            req.kv_cache.block_table = gpu_blocks;
+            req.status = RequestStatus::Decoding;
+            debug!(request_id = %req.id, "swapped in from host");
+            self.running.push(req);
+        }
+
+        // ── 2. If GPU is full and we have waiting requests, swap out LRU ──
+        while !self.waiting.is_empty() && self.allocator.num_free_gpu() < 1 && !self.running.is_empty() {
+            // Simple LRU: the request at the front of `running` is the oldest
+            let mut req = self.running.remove(0);
+            match self.allocator.swap_out(req.kv_cache.as_block_ids()) {
+                Ok(cpu_blocks) => {
+                    req.kv_cache.block_table = cpu_blocks;
+                    req.status = RequestStatus::Swapped;
+                    self.swapped.push_back(req);
+                    info!(request_id = %self.swapped.back().unwrap().id, "swapped out to host to make room for waiting");
+                }
+                Err(_) => {
+                    // CPU pool also full, fallback to preemption (back to waiting)
+                    warn!(request_id = %req.id, "CPU pool full during swap out — preempting");
+                    self.free_kv_blocks(&mut req);
+                    req.status = RequestStatus::Waiting;
+                    req.output_token_ids.clear();
+                    self.waiting.push_front(req);
+                }
+            }
+        }
+
+        // ── 3. Try to promote waiting requests ─────────────────────────────
         while let Some(req) = self.waiting.front() {
             if self.running.len() >= self.config.max_num_seqs {
                 break;
@@ -145,9 +190,9 @@ impl Scheduler {
                 (req.prompt_len() + self.config.block_size - 1) / self.config.block_size;
 
             // +1 for the first decode step
-            if self.allocator.num_free() < blocks_needed + 1 {
+            if self.allocator.num_free_gpu() < blocks_needed + 1 {
                 warn!(
-                    free  = self.allocator.num_free(),
+                    free  = self.allocator.num_free_gpu(),
                     need  = blocks_needed + 1,
                     "KV cache full; cannot admit new request"
                 );
@@ -250,6 +295,7 @@ impl Scheduler {
 
         // Append decoded tokens
         let mut done_ids: Vec<usize> = Vec::new();
+        let mut preempted_ids: Vec<usize> = Vec::new();
         for (id, token_id) in &output.decode_tokens {
             if let Some((idx, req)) = self
                 .running
@@ -269,11 +315,17 @@ impl Scheduler {
                         match self.allocator.allocate() {
                             Ok(h) => req.kv_cache.push_block(h.0),
                             Err(_) => {
-                                warn!(request_id = %id, "OOM during decode — aborting request");
-                                req.status = RequestStatus::Finished(FinishReason::Error(
-                                    "out of KV cache blocks".into(),
-                                ));
-                                done_ids.push(idx);
+                                // Try to swap out the request being processed if it hit OOM
+                                if self.allocator.num_free_cpu() >= req.kv_cache.num_blocks() {
+                                    warn!(request_id = %id, "OOM during decode — swapping to host");
+                                    preempted_ids.push(idx); // We'll handle the actual swap in the removal loop
+                                } else {
+                                    warn!(request_id = %id, "OOM during decode & CPU pool full — aborting");
+                                    req.status = RequestStatus::Finished(FinishReason::Error(
+                                        "out of KV cache blocks (GPU & CPU)".into(),
+                                    ));
+                                    done_ids.push(idx);
+                                }
                                 break;
                             }
                         }
@@ -282,13 +334,32 @@ impl Scheduler {
             }
         }
 
-        // Remove finished requests (in reverse order to keep indices valid)
-        done_ids.sort_unstable();
-        done_ids.dedup();
-        for &idx in done_ids.iter().rev() {
+        let mut all_remove_ids = done_ids.clone();
+        all_remove_ids.extend(preempted_ids.clone());
+        all_remove_ids.sort_unstable();
+        all_remove_ids.dedup();
+
+        for &idx in all_remove_ids.iter().rev() {
             let mut req = self.running.remove(idx);
-            self.free_kv_blocks(&mut req);
-            self.finished.push(req);
+            if preempted_ids.contains(&idx) {
+                match self.allocator.swap_out(req.kv_cache.as_block_ids()) {
+                    Ok(cpu_blocks) => {
+                        req.kv_cache.block_table = cpu_blocks;
+                        req.status = RequestStatus::Swapped;
+                        self.swapped.push_back(req);
+                    }
+                    Err(_) => {
+                        // This shouldn't happen if we checked num_free_cpu above, but safety first
+                        self.free_kv_blocks(&mut req);
+                        req.status = RequestStatus::Waiting;
+                        req.output_token_ids.clear();
+                        self.waiting.push_front(req);
+                    }
+                }
+            } else {
+                self.free_kv_blocks(&mut req);
+                self.finished.push(req);
+            }
         }
     }
 
@@ -343,12 +414,12 @@ impl Scheduler {
 
     /// Number of free KV cache blocks.
     pub fn num_free_blocks(&self) -> usize {
-        self.allocator.num_free()
+        self.allocator.num_free_gpu()
     }
 
     /// Access the KV cache block pool for model inference.
-    pub fn block_pool_mut(&mut self) -> &mut BlockPool {
-        unsafe { self.allocator.pool_mut() }
+    pub fn block_pool_mut(&mut self) -> &mut GpuBlockPool {
+        unsafe { self.allocator.gpu_pool_mut() }
     }
 }
 
@@ -363,6 +434,7 @@ mod tests {
             max_num_seqs: 4,
             block_size: 4,
             num_gpu_blocks: 32,
+            num_cpu_blocks: 16,
             max_model_len: 128,
         };
         Scheduler::new(config, Device::Cpu, DType::F32, 2, 8).unwrap()

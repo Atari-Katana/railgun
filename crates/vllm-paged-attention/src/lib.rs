@@ -7,5 +7,5 @@ pub mod block;
 pub mod kv_cache;
 
 pub use allocator::BlockAllocator;
-pub use block::{BlockHandle, BlockId, BlockPool};
+pub use block::{BlockHandle, BlockId, GpuBlockPool, CpuBlockPool};
 pub use kv_cache::KVCache;

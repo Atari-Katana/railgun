@@ -47,7 +47,7 @@ pub fn run(args: BenchmarkArgs) -> Result<()> {
     info!(num_requests = args.num_requests, model = %args.model.display(), "Starting benchmark");
 
     let tokenizer = RailgunTokenizer::load(&args.model)?;
-    let model = LlamaModel::load(&args.model, device)?;
+    let model = LlamaModel::load(&args.model, device, None)?;
     
     let config = model.config();
     let sched_config = SchedulerConfig {

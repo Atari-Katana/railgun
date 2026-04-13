@@ -3,6 +3,10 @@
 use candle_core::{Result, Tensor};
 use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder};
 use crate::llama::attention::PagedSelfAttention;
+use std::sync::Arc;
+
+#[cfg(feature = "cuda")]
+use vllm_cuda::kernels::PagedAttentionKernels;
 
 pub struct LlamaLayer {
     attention: PagedSelfAttention,
@@ -15,8 +19,10 @@ impl LlamaLayer {
     pub fn load(
         vb: VarBuilder,
         cfg: &candle_transformers::models::llama::Config,
+        #[cfg(feature = "cuda")]
+        kernels: Option<Arc<PagedAttentionKernels>>,
     ) -> Result<Self> {
-        let attention = PagedSelfAttention::load(vb.pp("self_attn"), cfg)?;
+        let attention = PagedSelfAttention::load(vb.pp("self_attn"), cfg, #[cfg(feature = "cuda")] kernels)?;
         let mlp = LlamaMLP::load(vb.pp("mlp"), cfg)?;
         let attention_norm = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let ffn_norm = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attention_layernorm"))?;
@@ -35,7 +41,7 @@ impl LlamaLayer {
         block_table: &Tensor,
         context_lens: &Tensor,
         _slot_mapping: &Tensor,
-        kv_cache: &mut vllm_paged_attention::block::BlockPool,
+        kv_cache: &mut vllm_paged_attention::block::GpuBlockPool,
         max_context_len: usize,
     ) -> Result<Tensor> {
         let residual = x;
@@ -90,12 +96,14 @@ impl RailgunLlama {
     pub fn load(
         vb: VarBuilder,
         cfg: &candle_transformers::models::llama::Config,
+        #[cfg(feature = "cuda")]
+        kernels: Option<Arc<PagedAttentionKernels>>,
     ) -> Result<Self> {
         let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_layers = vb.pp("model.layers");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(LlamaLayer::load(vb_layers.pp(i), cfg)?);
+            layers.push(LlamaLayer::load(vb_layers.pp(i), cfg, #[cfg(feature = "cuda")] kernels.clone())?);
         }
         let norm = candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         
@@ -118,7 +126,7 @@ impl RailgunLlama {
         block_table: &Tensor,
         context_lens: &Tensor,
         slot_mapping: &Tensor,
-        kv_cache: &mut vllm_paged_attention::block::BlockPool,
+        kv_cache: &mut vllm_paged_attention::block::GpuBlockPool,
     ) -> Result<Tensor> {
         let (_b_sz, seq_len) = tokens.dims2()?;
         let mut x = self.embed_tokens.forward(tokens)?;
@@ -136,7 +144,7 @@ impl RailgunLlama {
         block_table: &Tensor,
         context_lens: &Tensor,
         slot_mapping: &Tensor,
-        kv_cache: &mut vllm_paged_attention::block::BlockPool,
+        kv_cache: &mut vllm_paged_attention::block::GpuBlockPool,
         max_context_len: usize,
     ) -> Result<Tensor> {
         let mut x = self.embed_tokens.forward(input_ids)?;

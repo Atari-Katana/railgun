@@ -89,11 +89,19 @@ pub struct LlamaModel {
 
 impl LlamaModel {
     /// Load a Llama model using the native Railgun architecture.
-    pub fn load(model_dir: &Path, device: Device) -> Result<Self> {
+    pub fn load(model_dir: &Path, device: Device, dtype_override: Option<vllm_core::DType>) -> Result<Self> {
         let config_path = model_dir.join("config.json");
         let config = ModelConfig::from_file(&config_path)?;
 
-        let dtype = parse_dtype(config.torch_dtype.as_deref());
+        let dtype = match dtype_override {
+            Some(d) => match d {
+                vllm_core::DType::F32 => CDType::F32,
+                vllm_core::DType::F16 => CDType::F16,
+                vllm_core::DType::BF16 => CDType::BF16,
+                _ => return Err(CoreError::UnsupportedDType { dtype: d, context: "LlamaModel::load" }),
+            },
+            None => parse_dtype(config.torch_dtype.as_deref()),
+        };
         let candle_config = to_candle_config(&config);
         let candle_device = CDevice::try_from(device)?;
 
@@ -110,7 +118,23 @@ impl LlamaModel {
                 .map_err(CoreError::from)?
         };
 
-        let inner = RailgunLlama::load(vb, &candle_config).map_err(CoreError::from)?;
+        #[cfg(feature = "cuda")]
+        let kernels = if let Device::Cuda(ordinal) = device {
+            let candle_cuda_dev = match &candle_device {
+                CDevice::Cuda(c) => c,
+                _ => unreachable!(),
+            };
+            Some(std::sync::Arc::new(vllm_cuda::kernels::PagedAttentionKernels::new(candle_cuda_dev, ordinal as usize).map_err(CoreError::from)?))
+        } else {
+            None
+        };
+
+        let inner = RailgunLlama::load(
+            vb, 
+            &candle_config, 
+            #[cfg(feature = "cuda")]
+            kernels
+        ).map_err(CoreError::from)?;
 
         Ok(Self {
             inner,
@@ -141,7 +165,7 @@ impl LlamaModel {
         let block_size = 16;
         let num_blocks = (num_tokens + block_size - 1) / block_size + 1;
 
-        let mut pool = vllm_paged_attention::block::BlockPool::new(
+        let mut pool = vllm_paged_attention::block::GpuBlockPool::new(
             num_blocks, 
             block_size, 
             self.inner.num_kv_heads(), 
@@ -216,6 +240,29 @@ impl LlamaModel {
         }
 
         Ok(output)
+    }
+
+    /// Model registry factory for Llama.
+    pub fn factory(
+        model_dir: &Path,
+        _config: &ModelConfig,
+        device: Device,
+        dtype: Option<vllm_core::DType>,
+    ) -> Result<Box<dyn CausalLM>> {
+        Ok(Box::new(Self::load(model_dir, device, dtype)?))
+    }
+}
+
+impl crate::registry::ModelProvider for LlamaModel {
+    fn metadata() -> crate::registry::ModelMetadata {
+        crate::registry::ModelMetadata::new(
+            "LlamaForCausalLM",
+            Self::factory,
+            "Meta Llama (v2/v3) implementation with PagedAttention support",
+        )
+        .with_family("Llama")
+        .with_paged_attention(true)
+        .with_gqa(true)
     }
 }
 

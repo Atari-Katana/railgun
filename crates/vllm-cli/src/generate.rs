@@ -66,7 +66,7 @@ pub fn run(args: GenerateArgs) -> Result<()> {
 
     // ── Load model ─────────────────────────────────────────────────────────
     let t0 = Instant::now();
-    let mut model = LlamaModel::load(&args.model, device)
+    let mut model = LlamaModel::load(&args.model, device, None)
         .with_context(|| format!("loading model from {}", args.model.display()))?;
     let load_ms = t0.elapsed().as_millis();
     info!(load_ms, "model loaded");
