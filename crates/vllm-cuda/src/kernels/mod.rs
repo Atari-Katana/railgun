@@ -327,6 +327,17 @@ impl PagedAttentionKernels {
     ) -> CoreResult<()> {
         let stream = self.candle_dev.cuda_stream();
 
+        // PARTITION_SIZE = 256 must match the value used in the CUDA kernels
+        // paged_attention_v2_partition.cu and paged_attention_v2_reduce.cu
+        const _PARTITION_SIZE: i32 = 256;
+
+        if head_dim > 1024 {
+            return Err(CoreError::Tensor(format!(
+                "head_dim {} exceeds maximum block size 1024 for reduction kernel",
+                head_dim
+            )));
+        }
+
         let cfg = LaunchConfig {
             grid_dim: (batch_size as u32, num_heads as u32, 1),
             block_dim: (head_dim as u32, 1, 1),
