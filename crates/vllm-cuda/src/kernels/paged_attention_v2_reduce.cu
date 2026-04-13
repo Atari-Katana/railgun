@@ -40,6 +40,7 @@ extern "C" __global__ void paged_attention_v2_reduce(
     if (tid == 0) {
         float m_final = -INFINITY;
         int p_limit = min(num_partitions_for_seq, num_partitions);
+        p_limit = min(p_limit, 512); // Add this safety cap
         
         for (int p = 0; p < p_limit; ++p) {
             m_final = fmaxf(m_final, max_logits[stat_base_idx + p]);
@@ -62,6 +63,7 @@ extern "C" __global__ void paged_attention_v2_reduce(
     float m_final = s_max;
     float s_final = s_sum;
     int p_limit = min(num_partitions_for_seq, num_partitions);
+    p_limit = min(p_limit, 512); // Add this safety cap
 
     // 3. Compute weighted sum using pre-computed rescale factors
     float out_val = 0.0f;
