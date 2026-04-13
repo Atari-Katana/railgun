@@ -30,7 +30,6 @@ extern "C" __global__ void paged_attention_v1_plus(
     const float* q_ptr = query + (seq_idx * num_heads * head_dim) + (head_idx * head_dim);
 
     // Load Q into registers. Assuming head_dim <= blockDim.x.
-    // For head_dim=64, we'll use blockDim.x=64.
     float q_val = (tid < head_dim) ? q_ptr[tid] : 0.0f;
 
     float m = -INFINITY;
@@ -53,17 +52,35 @@ extern "C" __global__ void paged_attention_v1_plus(
 
         // Dot product Q * K
         float qk = q_val * k_val;
-        s_reduce[tid] = qk;
-        __syncthreads();
 
-        // Block reduction
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                s_reduce[tid] += s_reduce[tid + stride];
+        // Warp-level reduction
+        unsigned int mask = __activemask();
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            qk += __shfl_xor_sync(mask, qk, offset);
+        }
+
+        float score;
+        if (head_dim <= 32) {
+            score = __shfl_sync(mask, qk, 0) * scale;
+        } else {
+            __shared__ float s_score;
+            int warp_id = tid / 32;
+            int lane_id = tid % 32;
+            if (lane_id == 0) {
+                s_reduce[warp_id] = qk;
             }
             __syncthreads();
+
+            if (tid == 0) {
+                float sum = 0;
+                for (int i = 0; i < (head_dim + 31) / 32; ++i) {
+                    sum += s_reduce[i];
+                }
+                s_score = sum * scale;
+            }
+            __syncthreads();
+            score = s_score;
         }
-        float score = s_reduce[0] * scale;
 
         // Online Softmax (FlashAttention-style)
         float m_old = m;

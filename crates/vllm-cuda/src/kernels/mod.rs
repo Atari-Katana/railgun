@@ -167,12 +167,14 @@ impl PagedAttentionKernels {
         batch_size: i32,
     ) -> CoreResult<()> {
         let stream = self.candle_dev.cuda_stream();
-        let func = self.paged_attn_v1_plus_module.load_function("paged_attention_v1_plus").unwrap();
+        let func = self.paged_attn_v1_plus_module
+            .load_function("paged_attention_v1_plus")
+            .map_err(|e| CoreError::Tensor(format!("Failed to load paged_attention_v1_plus function: {e}")))?;
 
         let cfg = LaunchConfig {
             grid_dim: ((batch_size * num_heads) as u32, 1, 1),
             block_dim: (head_dim as u32, 1, 1),
-            shared_mem_bytes: (head_dim as u32 * 4), // 4 bytes per float for block reduction
+            shared_mem_bytes: (((head_dim + 31) / 32) * 4) as u32, // Enough for warp partial sums
         };
 
         let mut builder = stream.launch_builder(&func);
