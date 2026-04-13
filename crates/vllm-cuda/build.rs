@@ -8,7 +8,7 @@ macro_rules! info {
 }
 
 fn main() {
-    let kernels = vec!["paged_attention", "rope"];
+    let kernels = vec!["paged_attention", "paged_attention_v1_plus", "paged_attention_v2_partition", "paged_attention_v2_reduce", "rope"];
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
     for kernel in kernels {
