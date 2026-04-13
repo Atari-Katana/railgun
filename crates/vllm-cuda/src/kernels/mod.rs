@@ -7,6 +7,7 @@ use candle_core::cuda_backend::cudarc::nvrtc::Ptx;
 const PAGED_ATTENTION_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention.ptx"));
 const PAGED_ATTENTION_V1_PLUS_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention_v1_plus.ptx"));
 const PAGED_ATTENTION_V2_PARTITION_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention_v2_partition.ptx"));
+const PAGED_ATTENTION_V2_REDUCE_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention_v2_reduce.ptx"));
 const ROPE_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.ptx"));
 
 /// Manages the custom CUDA kernels for PagedAttention and RoPE.
@@ -16,11 +17,13 @@ pub struct PagedAttentionKernels {
     _paged_attn_module: Arc<CudaModule>,
     _paged_attn_v1_plus_module: Arc<CudaModule>,
     _paged_attn_v2_partition_module: Arc<CudaModule>,
+    _paged_attn_v2_reduce_module: Arc<CudaModule>,
     _rope_module: Arc<CudaModule>,
     // Cached functions
     paged_attn_v1_func: CudaFunction,
     paged_attn_v1_plus_func: CudaFunction,
     paged_attn_v2_partition_func: CudaFunction,
+    paged_attn_v2_reduce_func: CudaFunction,
     reshape_and_cache_func: CudaFunction,
     rope_func: CudaFunction,
 }
@@ -41,6 +44,10 @@ impl PagedAttentionKernels {
         let paged_attn_v2_partition_src = std::str::from_utf8(PAGED_ATTENTION_V2_PARTITION_PTX).map_err(|e| CoreError::DeviceInit {
             device: VllmDevice::Cuda(ordinal as u32),
             reason: format!("Failed to load PagedAttention V2 Partition PTX: {e}"),
+        })?;
+        let paged_attn_v2_reduce_src = std::str::from_utf8(PAGED_ATTENTION_V2_REDUCE_PTX).map_err(|e| CoreError::DeviceInit {
+            device: VllmDevice::Cuda(ordinal as u32),
+            reason: format!("Failed to load PagedAttention V2 Reduce PTX: {e}"),
         })?;
         let rope_src = std::str::from_utf8(ROPE_PTX).map_err(|e| CoreError::DeviceInit {
             device: VllmDevice::Cuda(ordinal as u32),
@@ -66,6 +73,13 @@ impl PagedAttentionKernels {
             .map_err(|e| CoreError::DeviceInit {
                 device: VllmDevice::Cuda(ordinal as u32),
                 reason: format!("Failed to load PagedAttention V2 partition group: {e}"),
+            })?;
+
+        let paged_attn_v2_reduce_module = context
+            .load_module(Ptx::from_src(paged_attn_v2_reduce_src))
+            .map_err(|e| CoreError::DeviceInit {
+                device: VllmDevice::Cuda(ordinal as u32),
+                reason: format!("Failed to load PagedAttention V2 reduce group: {e}"),
             })?;
 
         let rope_module = context
@@ -96,6 +110,13 @@ impl PagedAttentionKernels {
                 reason: format!("Failed to load paged_attention_v2_partition function: {e}"),
             })?;
 
+        let paged_attn_v2_reduce_func = paged_attn_v2_reduce_module
+            .load_function("paged_attention_v2_reduce")
+            .map_err(|e| CoreError::DeviceInit {
+                device: VllmDevice::Cuda(ordinal as u32),
+                reason: format!("Failed to load paged_attention_v2_reduce function: {e}"),
+            })?;
+
         let reshape_and_cache_func = paged_attn_module
             .load_function("reshape_and_cache")
             .map_err(|e| CoreError::DeviceInit {
@@ -115,10 +136,12 @@ impl PagedAttentionKernels {
             _paged_attn_module: paged_attn_module,
             _paged_attn_v1_plus_module: paged_attn_v1_plus_module,
             _paged_attn_v2_partition_module: paged_attn_v2_partition_module,
+            _paged_attn_v2_reduce_module: paged_attn_v2_reduce_module,
             _rope_module: rope_module,
             paged_attn_v1_func,
             paged_attn_v1_plus_func,
             paged_attn_v2_partition_func,
+            paged_attn_v2_reduce_func,
             reshape_and_cache_func,
             rope_func,
         })
@@ -284,6 +307,35 @@ impl PagedAttentionKernels {
             .arg(tmp_out).arg(exp_sums).arg(max_logits)
             .arg(&scale).arg(&num_heads).arg(&num_kv_heads).arg(&head_dim)
             .arg(&block_size).arg(&max_blocks_per_seq).arg(&num_partitions);
+        builder.launch(cfg)
+            .map_err(|e| CoreError::Tensor(format!("CUDA launch error: {e}")))?;
+
+        Ok(())
+    }
+
+    pub unsafe fn launch_v2_reduce(
+        &self,
+        output: &mut CudaSlice<f32>,
+        exp_sums: &CudaSlice<f32>,
+        max_logits: &CudaSlice<f32>,
+        tmp_out: &CudaSlice<f32>,
+        context_lens: &CudaSlice<i32>,
+        num_heads: i32,
+        head_dim: i32,
+        num_partitions: i32,
+        batch_size: i32,
+    ) -> CoreResult<()> {
+        let stream = self.candle_dev.cuda_stream();
+
+        let cfg = LaunchConfig {
+            grid_dim: (batch_size as u32, num_heads as u32, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = stream.launch_builder(&self.paged_attn_v2_reduce_func);
+        builder.arg(output).arg(exp_sums).arg(max_logits).arg(tmp_out).arg(context_lens)
+            .arg(&num_heads).arg(&head_dim).arg(&num_partitions);
         builder.launch(cfg)
             .map_err(|e| CoreError::Tensor(format!("CUDA launch error: {e}")))?;
 
