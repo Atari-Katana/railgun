@@ -1,60 +1,60 @@
-//! CUDA kernel loaders and launchers.
-//!
-//! Hand-written CUDA kernels (compiled to PTX at build time) are loaded 
-//! into the current [`CudaContext`] and executed via `cudarc`.
-
 use std::sync::Arc;
-use cudarc::driver::{CudaDevice, LaunchConfig};
-use vllm_core::{CoreError, Result, Device as VllmDevice};
+use vllm_core::{Device as VllmDevice, Result as CoreResult, CoreError};
 
-/// The PTX content for the PagedAttention kernels, compiled by build.rs.
-pub const PAGED_ATTENTION_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/paged_attention.ptx"));
-pub const ROPE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.ptx"));
+use cudarc::driver::{CudaContext, LaunchConfig, CudaModule, CudaSlice, PushKernelArg};
 
-/// Interface to optimized CUDA kernels for Railgun.
+const PAGED_ATTENTION_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention.ptx"));
+const ROPE_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.ptx"));
+
+/// Manages the custom CUDA kernels for PagedAttention and RoPE.
+#[derive(Debug, Clone)]
 pub struct PagedAttentionKernels {
-    device: Arc<CudaDevice>,
+    candle_dev: candle_core::CudaDevice,
+    paged_attn_module: Arc<CudaModule>,
+    rope_module: Arc<CudaModule>,
 }
 
 impl PagedAttentionKernels {
-    pub fn new(device: Arc<CudaDevice>, ordinal: usize) -> Result<Self> {
-        // Load the Paged Attention PTX
-        device
-            .load_ptx(PAGED_ATTENTION_PTX.into(), "paged_attn", &[
-                "paged_attention_v1",
-                "reshape_and_cache"
-            ])
+    pub fn new(candle_dev: &candle_core::CudaDevice, ordinal: usize) -> CoreResult<Self> {
+        let stream = candle_dev.cuda_stream();
+        let context = stream.context();
+
+        let paged_attn_module = context
+            .load_module(PAGED_ATTENTION_PTX.into())
             .map_err(|e| CoreError::DeviceInit {
                 device: VllmDevice::Cuda(ordinal as u32),
-                reason: format!("Failed to load PagedAttention PTX: {e}"),
+                reason: format!("Failed to load PagedAttention group: {e}"),
             })?;
 
-        // Load the RoPE PTX
-        device
-            .load_ptx(ROPE_PTX.into(), "rope_kernels", &["rotary_embedding_kernel"])
+        let rope_module = context
+            .load_module(ROPE_PTX.into())
             .map_err(|e| CoreError::DeviceInit {
                 device: VllmDevice::Cuda(ordinal as u32),
-                reason: format!("Failed to load RoPE PTX: {e}"),
+                reason: format!("Failed to load RoPE group: {e}"),
             })?;
 
-        Ok(Self { device })
+        Ok(Self {
+            candle_dev: candle_dev.clone(),
+            paged_attn_module,
+            rope_module,
+        })
     }
 
-    pub fn device(&self) -> &Arc<CudaDevice> {
-        &self.device
+    pub fn candle_device(&self) -> &candle_core::CudaDevice {
+        &self.candle_dev
     }
 
-    /// Launch the RoPE kernel.
     pub unsafe fn launch_rope(
         &self,
-        x: &mut cudarc::driver::CudaSlice<f32>,
-        cos_sin: &cudarc::driver::CudaSlice<f32>,
-        positions: &cudarc::driver::CudaSlice<i32>,
+        x: &mut CudaSlice<f32>,
+        cos_sin: &CudaSlice<f32>,
+        positions: &CudaSlice<i32>,
         num_heads: i32,
         head_dim: i32,
         num_tokens: i32,
-    ) -> Result<()> {
-        let func = self.device.get_func("rope_kernels", "rotary_embedding_kernel").unwrap();
+    ) -> CoreResult<()> {
+        let stream = self.candle_dev.cuda_stream();
+        let func = self.rope_module.load_function("rotary_embedding_kernel").unwrap();
         
         let cfg = LaunchConfig {
             grid_dim: (num_tokens as u32, num_heads as u32, 1),
@@ -62,58 +62,52 @@ impl PagedAttentionKernels {
             shared_mem_bytes: 0,
         };
 
-        let params = (x, cos_sin, positions, num_heads, head_dim);
-        func.launch(cfg, params)
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(x).arg(cos_sin).arg(positions).arg(num_heads).arg(head_dim);
+        builder.launch(cfg)
             .map_err(|e| CoreError::Tensor(format!("RoPE launch error: {e}")))?;
 
         Ok(())
     }
 
-    /// Launch the reshape_and_cache kernel.
     pub unsafe fn launch_reshape_and_cache(
         &self,
-        k: &cudarc::driver::CudaSlice<f32>,
-        v: &cudarc::driver::CudaSlice<f32>,
-        k_cache: &mut cudarc::driver::CudaSlice<f32>,
-        v_cache: &mut cudarc::driver::CudaSlice<f32>,
-        slot_mapping: &cudarc::driver::CudaSlice<i32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+        slot_mapping: &CudaSlice<i32>,
         num_kv_heads: i32,
         head_dim: i32,
         block_size: i32,
         batch_size: i32,
-    ) -> Result<()> {
-        let func = self.device.get_func("paged_attn", "reshape_and_cache").unwrap();
+    ) -> CoreResult<()> {
+        let stream = self.candle_dev.cuda_stream();
+        let func = self.paged_attn_module.load_function("reshape_and_cache").unwrap();
         
-        // grid = (batch_size, 1, 1)
-        // block = (1, num_kv_heads, head_dim) - Simplify: one thread per dimension
-        // Note: For large head_dim, this should be tuned.
         let cfg = LaunchConfig {
             grid_dim: (batch_size as u32, 1, 1),
             block_dim: (1, num_kv_heads as u32, head_dim as u32),
             shared_mem_bytes: 0,
         };
 
-        let params = (
-            k, v, k_cache, v_cache, slot_mapping,
-            num_kv_heads, head_dim, block_size
-        );
-
-        func.launch(cfg, params)
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(k).arg(v).arg(k_cache).arg(v_cache).arg(slot_mapping)
+            .arg(num_kv_heads).arg(head_dim).arg(block_size);
+        builder.launch(cfg)
             .map_err(|e| CoreError::Tensor(format!("CUDA launch error: {e}")))?;
 
         Ok(())
     }
 
-    /// Launch the paged_attention_v1 kernel.
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch_v1(
         &self,
-        query: &cudarc::driver::CudaSlice<f32>,
-        key_cache: &cudarc::driver::CudaSlice<f32>,
-        value_cache: &cudarc::driver::CudaSlice<f32>,
-        block_table: &cudarc::driver::CudaSlice<i32>,
-        context_lens: &cudarc::driver::CudaSlice<i32>,
-        output: &mut cudarc::driver::CudaSlice<f32>,
+        query: &CudaSlice<f32>,
+        key_cache: &CudaSlice<f32>,
+        value_cache: &CudaSlice<f32>,
+        block_table: &CudaSlice<i32>,
+        context_lens: &CudaSlice<i32>,
+        output: &mut CudaSlice<f32>,
         scale: f32,
         num_heads: i32,
         num_kv_heads: i32,
@@ -121,33 +115,21 @@ impl PagedAttentionKernels {
         block_size: i32,
         max_blocks_per_seq: i32,
         batch_size: i32,
-    ) -> Result<()> {
-        let func = self.device.get_func("paged_attn", "paged_attention_v1").unwrap();
+    ) -> CoreResult<()> {
+        let stream = self.candle_dev.cuda_stream();
+        let func = self.paged_attn_module.load_function("paged_attention_v1").unwrap();
 
-        // grid = (batch_size, 1, 1)
-        // block = (1, num_heads, 1) - One thread per head in V1
         let cfg = LaunchConfig {
             grid_dim: (batch_size as u32, 1, 1),
             block_dim: (1, num_heads as u32, 1),
             shared_mem_bytes: 0,
         };
 
-        let params = (
-            query,
-            key_cache,
-            value_cache,
-            block_table,
-            context_lens,
-            output,
-            scale,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            block_size,
-            max_blocks_per_seq,
-        );
-
-        func.launch(cfg, params)
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(query).arg(key_cache).arg(value_cache).arg(block_table).arg(context_lens)
+            .arg(output).arg(scale).arg(num_heads).arg(num_kv_heads).arg(head_dim)
+            .arg(block_size).arg(max_blocks_per_seq);
+        builder.launch(cfg)
             .map_err(|e| CoreError::Tensor(format!("CUDA launch error: {e}")))?;
 
         Ok(())

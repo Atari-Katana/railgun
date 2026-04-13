@@ -68,7 +68,7 @@ impl PagedAttentionOp {
                 candle_core::Storage::Cuda(bt_cuda),
                 candle_core::Storage::Cuda(cl_cuda),
             ) => {
-                let dev = self.kernels.device();
+                let dev = self.kernels.candle_device();
                 let out_shape = Shape::from((batch_size, num_heads, head_dim));
                 let out_size = out_shape.elem_count();
                 let mut out_cuda = dev.alloc_zeros::<f32>(out_size).map_err(candle_core::Error::from)?;

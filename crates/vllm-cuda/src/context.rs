@@ -20,7 +20,8 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::CudaDevice;
+use candle_core::CudaDevice;
+pub use cudarc::driver::CudaContext;
 use thiserror::Error;
 use tracing::debug;
 
@@ -31,12 +32,15 @@ pub enum CudaError {
     #[error("CUDA init failed for device {ordinal}: {source}")]
     Init {
         ordinal: u32,
-        source: cudarc::driver::DriverError,
+        source: candle_core::Error,
     },
 
     /// A CUDA runtime operation failed.
     #[error("CUDA operation failed: {0}")]
     Driver(#[from] cudarc::driver::DriverError),
+    
+    #[error("Candle error: {0}")]
+    Candle(#[from] candle_core::Error),
 }
 
 pub type CudaResult<T> = std::result::Result<T, CudaError>;
@@ -44,25 +48,25 @@ pub type CudaResult<T> = std::result::Result<T, CudaError>;
 use crate::kernels::PagedAttentionKernels;
 
 /// Owns a CUDA device and its primary stream.
-pub struct CudaContext {
-    device: Arc<CudaDevice>,
+pub struct RailgunCudaContext {
+    candle_dev: CudaDevice,
     kernels: PagedAttentionKernels,
     ordinal: u32,
 }
 
-impl CudaContext {
+impl RailgunCudaContext {
     pub fn new(ordinal: u32) -> CudaResult<Self> {
-        debug!(%ordinal, "creating CUDA context");
-        let device = Arc::new(CudaDevice::new(ordinal as usize).map_err(|e| CudaError::Init {
-            ordinal,
-            source: e,
-        })?);
+        debug!(%ordinal, "creating CUDA context via candle");
+        let candle_dev = CudaDevice::new(ordinal as usize)?;
         
-        let kernels = PagedAttentionKernels::new(device.clone(), ordinal as usize)
-            .map_err(|e| CudaError::Driver(cudarc::driver::DriverError::Unknown(0)))?; // Simplified for now
+        let stream = candle_dev.cuda_stream();
+        let context = stream.context();
+        
+        let kernels = PagedAttentionKernels::new(&candle_dev, ordinal as usize)
+            .map_err(|e| CudaError::Init { ordinal, source: candle_core::Error::Msg(e.to_string()) })?;
 
         Ok(Self {
-            device,
+            candle_dev,
             kernels,
             ordinal,
         })
@@ -76,16 +80,21 @@ impl CudaContext {
         &self.kernels
     }
 
-    pub fn device(&self) -> Arc<CudaDevice> {
-        self.device.clone()
+    pub fn candle_device(&self) -> &CudaDevice {
+        &self.candle_dev
+    }
+
+    pub fn context(&self) -> Arc<CudaContext> {
+        self.candle_dev.cuda_stream().context().clone()
     }
 
     pub fn synchronize(&self) -> CudaResult<()> {
-        self.device.synchronize().map_err(CudaError::Driver)
+        self.candle_dev.synchronize().map_err(CudaError::Candle)
     }
 
     pub fn memory_info(&self) -> CudaResult<(usize, usize)> {
-        self.device.memory_info().map_err(CudaError::Driver)
+        // We still need a way to get memory info. CudaContext has it.
+        self.context().memory_info().map_err(CudaError::Driver)
     }
 }
 

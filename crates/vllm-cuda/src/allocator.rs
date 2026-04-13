@@ -20,24 +20,23 @@
 //! all primitive numeric types (`f32`, `f16`, `u32`, `i32`, …).
 
 use std::sync::Arc;
-use cudarc::driver::{CudaDevice, CudaSlice, CudaViewMut, DeviceRepr};
-
-use super::context::{CudaError, CudaResult};
+use cudarc::driver::{CudaSlice, CudaViewMut, DeviceRepr};
+use super::context::{CudaError, CudaResult, CudaContext};
 
 /// An owned buffer of `T` residing in CUDA device memory.
 pub struct DeviceBuffer<T: DeviceRepr> {
     slice: CudaSlice<T>,
-    device: Arc<CudaDevice>,
+    device: Arc<CudaContext>,
     len: usize,
 }
 
 impl<T: DeviceRepr + 'static> DeviceBuffer<T> {
-    pub fn alloc(len: usize, device: Arc<CudaDevice>) -> CudaResult<Self> {
+    pub fn alloc(len: usize, device: Arc<CudaContext>) -> CudaResult<Self> {
         let slice = unsafe { device.alloc::<T>(len) }.map_err(CudaError::Driver)?;
         Ok(Self { slice, device, len })
     }
 
-    pub fn zeros(len: usize, device: Arc<CudaDevice>) -> CudaResult<Self>
+    pub fn zeros(len: usize, device: Arc<CudaContext>) -> CudaResult<Self>
     where
         T: cudarc::driver::ValidAsZeroBits,
     {

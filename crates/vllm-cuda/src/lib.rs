@@ -22,6 +22,6 @@ pub mod kernels;
 #[cfg(feature = "cuda")]
 pub use allocator::DeviceBuffer;
 #[cfg(feature = "cuda")]
-pub use context::CudaContext;
+pub use context::RailgunCudaContext as CudaContext;
 #[cfg(feature = "cuda")]
 pub use kernels::PagedAttentionKernels;
