@@ -1,11 +1,6 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
-
-#ifndef INFINITY
-#define INFINITY __int_as_float(0x7f800000)
-#endif
-
-#define PARTITION_SIZE 256
+#include "paged_attention_utils.cuh"
 
 extern "C" __global__ void paged_attention_v2_partition(
     const float* __restrict__ query,           // [batch, num_heads, head_dim]
