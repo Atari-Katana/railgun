@@ -1,0 +1,12 @@
+[package]
+name        = "vllm-paged-attention"
+description = "PagedAttention block allocator and KV cache management for Railgun"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+
+[dependencies]
+vllm-core = { path = "../vllm-core" }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+candle-core = { workspace = true }

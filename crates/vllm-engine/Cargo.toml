@@ -1,0 +1,20 @@
+[package]
+name        = "vllm-engine"
+description = "Async inference engine orchestrating scheduler, model, and sampler"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+
+[dependencies]
+vllm-core            = { path = "../vllm-core" }
+vllm-paged-attention = { path = "../vllm-paged-attention" }
+vllm-scheduler       = { path = "../vllm-scheduler" }
+vllm-models          = { path = "../vllm-models" }
+candle-core = { workspace = true }
+anyhow    = { workspace = true }
+tokio     = { workspace = true }
+tracing   = { workspace = true }
+uuid      = { workspace = true }
+flume     = { workspace = true }
+serde     = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name        = "vllm-cuda"
+description = "CUDA backend for Railgun: device context, memory management, and kernel launchers"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+
+[features]
+default = []
+cuda    = ["cudarc", "candle-core/cuda"]
+
+[dependencies]
+vllm-core  = { path = "../vllm-core" }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+candle-core = { workspace = true, optional = true }
+cudarc     = { workspace = true, optional = true }
+
+[build-dependencies]
+# Reserved for nvcc kernel compilation in later phases

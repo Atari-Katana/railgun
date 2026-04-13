@@ -1,0 +1,14 @@
+[package]
+name        = "vllm-scheduler"
+description = "Continuous batching scheduler for Railgun"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+
+[dependencies]
+vllm-core              = { path = "../vllm-core" }
+vllm-paged-attention   = { path = "../vllm-paged-attention" }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+uuid      = { workspace = true }
+serde     = { workspace = true }

@@ -1,0 +1,2 @@
+#!/bin/bash
+exec /usr/local/cuda/bin/nvcc -ccbin /usr/bin/gcc-14 "$@"

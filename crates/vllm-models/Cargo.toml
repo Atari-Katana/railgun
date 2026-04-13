@@ -1,0 +1,24 @@
+[package]
+name        = "vllm-models"
+description = "Model implementations (Llama, Mistral, Qwen) for Railgun"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+
+[features]
+default = []
+cuda    = ["vllm-cuda", "candle-core/cuda", "candle-nn/cuda"]
+
+[dependencies]
+vllm-core            = { path = "../vllm-core" }
+vllm-paged-attention = { path = "../vllm-paged-attention" }
+vllm-cuda            = { path = "../vllm-cuda", optional = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+candle-core        = { workspace = true }
+candle-nn          = { workspace = true }
+candle-transformers = { workspace = true }
+tokenizers = { workspace = true }
+half       = { workspace = true }

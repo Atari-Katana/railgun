@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vllm-core",
+    "crates/vllm-cuda",
+    "crates/vllm-paged-attention",
+    "crates/vllm-scheduler",
+    "crates/vllm-models",
+    "crates/vllm-engine",
+    "crates/vllm-cli",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+license      = "Apache-2.0"
+authors      = ["Railgun Contributors"]
+repository   = "https://github.com/Atari-Katana/railgun"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# Core async
+tokio      = { version = "1", features = ["full"] }
+# Error handling
+thiserror  = "2"
+anyhow     = "1"
+# Serialisation
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+# ML / Tensor
+candle-core        = { version = "0.10" }
+candle-nn          = "0.10"
+candle-transformers = "0.10"
+# CUDA bindings
+cudarc = "0.19"
+# Tokenisation
+tokenizers = "0.21"
+# HTTP server
+axum       = { version = "0.8", features = ["json", "macros"] }
+tower      = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+# CLI
+clap = { version = "4", features = ["derive"] }
+# Async channels / primitives
+flume = "0.11"
+# Stream utilities
+async-stream = "0.3"
+futures      = "0.3"
+tokio-stream = "0.1"
+# IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Testing
+criterion  = { version = "0.5", features = ["html_reports"] }
+# Numeric
+half = { version = "2", features = ["num-traits", "serde"] }
+
+[profile.release]
+opt-level = 3
+lto       = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits  = "release"
+debug     = true

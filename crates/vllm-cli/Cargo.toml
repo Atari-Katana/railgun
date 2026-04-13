@@ -1,0 +1,30 @@
+[package]
+name        = "vllm-cli"
+description = "Railgun CLI and OpenAI-compatible HTTP server"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+
+[[bin]]
+name = "railgun"
+path = "src/main.rs"
+
+[dependencies]
+vllm-engine = { path = "../vllm-engine" }
+vllm-models = { path = "../vllm-models" }
+vllm-scheduler = { path = "../vllm-scheduler" }
+vllm-core   = { path = "../vllm-core" }
+anyhow      = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum        = { workspace = true }
+tower       = { workspace = true }
+tower-http  = { workspace = true }
+clap        = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+uuid        = { workspace = true }
+async-stream = { workspace = true }
+futures      = { workspace = true }
+tokio-stream = { workspace = true }
