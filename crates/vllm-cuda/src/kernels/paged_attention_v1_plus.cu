@@ -74,6 +74,7 @@ extern "C" __global__ void paged_attention_v1_plus(
                 sum += s_reduce[i];
             }
             score = sum * scale;
+            __syncthreads();
         }
 
         // Online Softmax (FlashAttention-style)
