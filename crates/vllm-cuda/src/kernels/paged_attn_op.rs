@@ -51,6 +51,13 @@ impl PagedAttentionOp {
         context_lens: &Tensor,
         max_context_len: usize,
     ) -> Result<Tensor> {
+        if self.head_dim % 4 != 0 {
+            return Err(candle_core::Error::Msg(format!(
+                "Head dimension ({}) must be a multiple of 4 for IsoQuant.",
+                self.head_dim
+            )));
+        }
+
         let _device = q.device();
         let (batch_size, num_heads, head_dim) = q.dims3()?;
         let (_, _num_kv_heads, block_size, _) = k_cache.dims4()?;
