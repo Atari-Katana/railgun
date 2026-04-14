@@ -49,6 +49,8 @@ impl std::fmt::Display for BlockId {
 pub struct GpuBlockPool {
     /// `[num_blocks, 2, num_kv_heads, block_size, head_dim]`
     pub storage: CTensor,
+    /// `[num_blocks, num_kv_heads, head_dim / 4, 8]`
+    pub rotation_metadata: CTensor,
     pub block_size: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
@@ -67,8 +69,15 @@ impl GpuBlockPool {
     ) -> vllm_core::Result<Self> {
         let shape = [num_blocks, 2, num_kv_heads, block_size, head_dim];
         let storage = vllm_core::Tensor::zeros(&shape, dtype, device.clone())?;
+
+        // IsoQuant rotation metadata: [num_blocks, num_kv_heads, head_dim / 4, 8]
+        // 8 floats for qL and qR in blockwise SO(4) rotation
+        let rotation_shape = [num_blocks, num_kv_heads, head_dim / 4, 8];
+        let rotation_metadata = vllm_core::Tensor::zeros(&rotation_shape, DType::F32, device.clone())?;
+
         Ok(Self {
             storage: storage.into_inner(),
+            rotation_metadata: rotation_metadata.into_inner(),
             block_size,
             num_kv_heads,
             head_dim,
@@ -77,12 +86,20 @@ impl GpuBlockPool {
         })
     }
 
+    pub fn rotation_metadata(&self) -> &CTensor {
+        &self.rotation_metadata
+    }
+
     pub fn k_cache(&self) -> candle_core::Result<CTensor> {
         self.storage.narrow(1, 0, 1)?.squeeze(1)
     }
 
     pub fn v_cache(&self) -> candle_core::Result<CTensor> {
         self.storage.narrow(1, 1, 1)?.squeeze(1)
+    }
+
+    pub fn rotation_metadata(&self) -> candle_core::Result<CTensor> {
+        Ok(self.rotation_metadata.clone())
     }
 }
 
@@ -104,9 +121,15 @@ impl CpuBlockPool {
         dtype: DType,
     ) -> vllm_core::Result<Self> {
         let shape = [num_blocks, 2, num_kv_heads, block_size, head_dim];
-        let storage = vllm_core::Tensor::zeros(&shape, dtype, Device::Cpu)?;
+        let storage = vllm_core::Tensor::zeros(&shape, dtype, device.clone())?;
+
+        let rot_shape = [num_blocks, num_kv_heads, head_dim / 4, 8];
+        let rotation_metadata = vllm_core::Tensor::zeros(&rot_shape, DType::F32, device.clone())?;
+
         Ok(Self {
             storage: storage.into_inner(),
+            rotation_metadata: rotation_metadata.into_inner(),
+
             block_size,
             num_kv_heads,
             head_dim,

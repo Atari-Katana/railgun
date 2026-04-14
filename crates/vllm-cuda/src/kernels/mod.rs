@@ -1,14 +1,24 @@
 use std::sync::Arc;
-use vllm_core::{Device as VllmDevice, Result as CoreResult, CoreError};
+use vllm_core::{CoreError, Device as VllmDevice, Result as CoreResult};
 
-use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, CudaModule, CudaSlice, PushKernelArg, CudaFunction};
+use candle_core::cuda_backend::cudarc::driver::{
+    CudaFunction, CudaModule, CudaSlice, LaunchConfig, PushKernelArg,
+};
 use candle_core::cuda_backend::cudarc::nvrtc::Ptx;
 
 const PAGED_ATTENTION_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention.ptx"));
-const PAGED_ATTENTION_V1_PLUS_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention_v1_plus.ptx"));
-const PAGED_ATTENTION_V2_PARTITION_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention_v2_partition.ptx"));
-const PAGED_ATTENTION_V2_REDUCE_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention_v2_reduce.ptx"));
+const PAGED_ATTENTION_V1_PLUS_PTX: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention_v1_plus.ptx"));
+const PAGED_ATTENTION_V2_PARTITION_PTX: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/paged_attention_v2_partition.ptx"
+));
+const PAGED_ATTENTION_V2_REDUCE_PTX: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/paged_attention_v2_reduce.ptx"));
 const ROPE_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.ptx"));
+
+const MAX_HEAD_DIM_PAGED_ATTENTION: i32 = 256;
+const MAX_HEAD_DIM_V2_REDUCE: i32 = 1024;
 
 /// Manages the custom CUDA kernels for PagedAttention and RoPE.
 #[derive(Debug, Clone)]
@@ -25,7 +35,22 @@ pub struct PagedAttentionKernels {
     paged_attn_v2_partition_func: CudaFunction,
     paged_attn_v2_reduce_func: CudaFunction,
     reshape_and_cache_func: CudaFunction,
+    reshape_and_cache_isoquant_func: CudaFunction,
     rope_func: CudaFunction,
+}
+
+fn check_paged_attention_head_dim(head_dim: i32) -> CoreResult<()> {
+    if head_dim % 4 != 0 || head_dim > MAX_HEAD_DIM_PAGED_ATTENTION {
+        Err(CoreError::NotSupported {
+            feature: "PagedAttention",
+            reason: format!(
+                "head_dim must be a multiple of 4 and <= {}, but got {}",
+                MAX_HEAD_DIM_PAGED_ATTENTION, head_dim
+            ),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 impl PagedAttentionKernels {
@@ -33,22 +58,29 @@ impl PagedAttentionKernels {
         let stream = candle_dev.cuda_stream();
         let context = stream.context();
 
-        let paged_attn_src = std::str::from_utf8(PAGED_ATTENTION_PTX).map_err(|e| CoreError::DeviceInit {
-            device: VllmDevice::Cuda(ordinal as u32),
-            reason: format!("Failed to load PagedAttention PTX: {e}"),
-        })?;
-        let paged_attn_v1_plus_src = std::str::from_utf8(PAGED_ATTENTION_V1_PLUS_PTX).map_err(|e| CoreError::DeviceInit {
-            device: VllmDevice::Cuda(ordinal as u32),
-            reason: format!("Failed to load PagedAttention V1+ PTX: {e}"),
-        })?;
-        let paged_attn_v2_partition_src = std::str::from_utf8(PAGED_ATTENTION_V2_PARTITION_PTX).map_err(|e| CoreError::DeviceInit {
-            device: VllmDevice::Cuda(ordinal as u32),
-            reason: format!("Failed to load PagedAttention V2 Partition PTX: {e}"),
-        })?;
-        let paged_attn_v2_reduce_src = std::str::from_utf8(PAGED_ATTENTION_V2_REDUCE_PTX).map_err(|e| CoreError::DeviceInit {
-            device: VllmDevice::Cuda(ordinal as u32),
-            reason: format!("Failed to load PagedAttention V2 Reduce PTX: {e}"),
-        })?;
+        let paged_attn_src =
+            std::str::from_utf8(PAGED_ATTENTION_PTX).map_err(|e| CoreError::DeviceInit {
+                device: VllmDevice::Cuda(ordinal as u32),
+                reason: format!("Failed to load PagedAttention PTX: {e}"),
+            })?;
+        let paged_attn_v1_plus_src = std::str::from_utf8(PAGED_ATTENTION_V1_PLUS_PTX).map_err(
+            |e| CoreError::DeviceInit {
+                device: VllmDevice::Cuda(ordinal as u32),
+                reason: format!("Failed to load PagedAttention V1+ PTX: {e}"),
+            },
+        )?;
+        let paged_attn_v2_partition_src =
+            std::str::from_utf8(PAGED_ATTENTION_V2_PARTITION_PTX).map_err(|e| {
+                CoreError::DeviceInit {
+                    device: VllmDevice::Cuda(ordinal as u32),
+                    reason: format!("Failed to load PagedAttention V2 Partition PTX: {e}"),
+                }
+            })?;
+        let paged_attn_v2_reduce_src = std::str::from_utf8(PAGED_ATTENTION_V2_REDUCE_PTX)
+            .map_err(|e| CoreError::DeviceInit {
+                device: VllmDevice::Cuda(ordinal as u32),
+                reason: format!("Failed to load PagedAttention V2 Reduce PTX: {e}"),
+            })?;
         let rope_src = std::str::from_utf8(ROPE_PTX).map_err(|e| CoreError::DeviceInit {
             device: VllmDevice::Cuda(ordinal as u32),
             reason: format!("Failed to load RoPE PTX: {e}"),
@@ -82,12 +114,13 @@ impl PagedAttentionKernels {
                 reason: format!("Failed to load PagedAttention V2 reduce group: {e}"),
             })?;
 
-        let rope_module = context
-            .load_module(Ptx::from_src(rope_src))
-            .map_err(|e| CoreError::DeviceInit {
-                device: VllmDevice::Cuda(ordinal as u32),
-                reason: format!("Failed to load RoPE group: {e}"),
-            })?;
+        let rope_module =
+            context
+                .load_module(Ptx::from_src(rope_src))
+                .map_err(|e| CoreError::DeviceInit {
+                    device: VllmDevice::Cuda(ordinal as u32),
+                    reason: format!("Failed to load RoPE group: {e}"),
+                })?;
 
         let paged_attn_v1_func = paged_attn_module
             .load_function("paged_attention_v1")
@@ -124,12 +157,20 @@ impl PagedAttentionKernels {
                 reason: format!("Failed to load reshape_and_cache function: {e}"),
             })?;
 
-        let rope_func = rope_module
-            .load_function("rotary_embedding_kernel")
+        let reshape_and_cache_isoquant_func = paged_attn_module
+            .load_function("reshape_and_cache_isoquant")
             .map_err(|e| CoreError::DeviceInit {
                 device: VllmDevice::Cuda(ordinal as u32),
-                reason: format!("Failed to load rotary_embedding_kernel function: {e}"),
+                reason: format!("Failed to load reshape_and_cache_isoquant function: {e}"),
             })?;
+
+        let rope_func =
+            rope_module
+                .load_function("rotary_embedding_kernel")
+                .map_err(|e| CoreError::DeviceInit {
+                    device: VllmDevice::Cuda(ordinal as u32),
+                    reason: format!("Failed to load rotary_embedding_kernel function: {e}"),
+                })?;
 
         Ok(Self {
             candle_dev: candle_dev.clone(),
@@ -143,6 +184,7 @@ impl PagedAttentionKernels {
             paged_attn_v2_partition_func,
             paged_attn_v2_reduce_func,
             reshape_and_cache_func,
+            reshape_and_cache_isoquant_func,
             rope_func,
         })
     }
@@ -161,7 +203,7 @@ impl PagedAttentionKernels {
         num_tokens: i32,
     ) -> CoreResult<()> {
         let stream = self.candle_dev.cuda_stream();
-        
+
         let cfg = LaunchConfig {
             grid_dim: (num_tokens as u32, num_heads as u32, 1),
             block_dim: ((head_dim / 2) as u32, 1, 1),
@@ -169,9 +211,15 @@ impl PagedAttentionKernels {
         };
 
         let mut builder = stream.launch_builder(&self.rope_func);
-        builder.arg(x).arg(cos_sin).arg(positions).arg(&num_heads).arg(&head_dim);
-        builder.launch(cfg)
-            .map_err(|e| CoreError::Tensor(format!("RoPE launch error: {e}")))?;
+        builder
+            .arg(x)
+            .arg(cos_sin)
+            .arg(positions)
+            .arg(&num_heads)
+            .arg(&head_dim);
+        builder
+            .launch(cfg)
+            .map_err(|e| CoreError::Tensor(format!("RoPE kernel launch failed: {e}")))?;
 
         Ok(())
     }
@@ -189,7 +237,7 @@ impl PagedAttentionKernels {
         batch_size: i32,
     ) -> CoreResult<()> {
         let stream = self.candle_dev.cuda_stream();
-        
+
         let cfg = LaunchConfig {
             grid_dim: (batch_size as u32, 1, 1),
             block_dim: (1, num_kv_heads as u32, head_dim as u32),
@@ -197,10 +245,59 @@ impl PagedAttentionKernels {
         };
 
         let mut builder = stream.launch_builder(&self.reshape_and_cache_func);
-        builder.arg(k).arg(v).arg(k_cache).arg(v_cache).arg(slot_mapping)
-            .arg(&num_kv_heads).arg(&head_dim).arg(&block_size);
-        builder.launch(cfg)
-            .map_err(|e| CoreError::Tensor(format!("CUDA launch error: {e}")))?;
+        builder
+            .arg(k)
+            .arg(v)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(slot_mapping)
+            .arg(&num_kv_heads)
+            .arg(&head_dim)
+            .arg(&block_size);
+        builder.launch(cfg).map_err(|e| {
+            CoreError::Tensor(format!("reshape_and_cache kernel launch failed: {e}"))
+        })?;
+
+        Ok(())
+    }
+
+    pub unsafe fn launch_reshape_and_cache_isoquant(
+        &self,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+        slot_mapping: &CudaSlice<i32>,
+        rotation_metadata: &mut CudaSlice<f32>,
+        num_kv_heads: i32,
+        head_dim: i32,
+        block_size: i32,
+        batch_size: i32,
+    ) -> CoreResult<()> {
+        let stream = self.candle_dev.cuda_stream();
+
+        let cfg = LaunchConfig {
+            grid_dim: (batch_size as u32, 1, 1),
+            block_dim: ((head_dim / 4) as u32, num_kv_heads as u32, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = stream.launch_builder(&self.reshape_and_cache_isoquant_func);
+        builder
+            .arg(k)
+            .arg(v)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(slot_mapping)
+            .arg(rotation_metadata)
+            .arg(&num_kv_heads)
+            .arg(&head_dim)
+            .arg(&block_size);
+        builder.launch(cfg).map_err(|e| {
+            CoreError::Tensor(format!(
+                "reshape_and_cache_isoquant kernel launch failed: {e}"
+            ))
+        })?;
 
         Ok(())
     }
@@ -230,11 +327,22 @@ impl PagedAttentionKernels {
         };
 
         let mut builder = stream.launch_builder(&self.paged_attn_v1_func);
-        builder.arg(query).arg(key_cache).arg(value_cache).arg(block_table).arg(context_lens)
-            .arg(output).arg(&scale).arg(&num_heads).arg(&num_kv_heads).arg(&head_dim)
-            .arg(&block_size).arg(&max_blocks_per_seq);
-        builder.launch(cfg)
-            .map_err(|e| CoreError::Tensor(format!("CUDA launch error: {e}")))?;
+        builder
+            .arg(query)
+            .arg(key_cache)
+            .arg(value_cache)
+            .arg(block_table)
+            .arg(context_lens)
+            .arg(output)
+            .arg(&scale)
+            .arg(&num_heads)
+            .arg(&num_kv_heads)
+            .arg(&head_dim)
+            .arg(&block_size)
+            .arg(&max_blocks_per_seq);
+        builder.launch(cfg).map_err(|e| {
+            CoreError::Tensor(format!("paged_attention_v1 kernel launch failed: {e}"))
+        })?;
 
         Ok(())
     }
@@ -247,6 +355,7 @@ impl PagedAttentionKernels {
         block_table: &CudaSlice<i32>,
         context_lens: &CudaSlice<i32>,
         output: &mut CudaSlice<f32>,
+        rotation_metadata: &CudaSlice<f32>,
         scale: f32,
         num_heads: i32,
         num_kv_heads: i32,
@@ -255,6 +364,7 @@ impl PagedAttentionKernels {
         max_blocks_per_seq: i32,
         batch_size: i32,
     ) -> CoreResult<()> {
+        check_paged_attention_head_dim(head_dim)?;
         let stream = self.candle_dev.cuda_stream();
 
         let block_size_x = ((head_dim + 31) / 32 * 32) as u32;
@@ -265,11 +375,25 @@ impl PagedAttentionKernels {
         };
 
         let mut builder = stream.launch_builder(&self.paged_attn_v1_plus_func);
-        builder.arg(query).arg(key_cache).arg(value_cache).arg(block_table).arg(context_lens)
-            .arg(output).arg(&scale).arg(&num_heads).arg(&num_kv_heads).arg(&head_dim)
-            .arg(&block_size).arg(&max_blocks_per_seq);
-        builder.launch(cfg)
-            .map_err(|e| CoreError::Tensor(format!("CUDA launch error: {e}")))?;
+        builder
+            .arg(query)
+            .arg(key_cache)
+            .arg(value_cache)
+            .arg(block_table)
+            .arg(context_lens)
+            .arg(output)
+            .arg(rotation_metadata)
+            .arg(&scale)
+            .arg(&num_heads)
+            .arg(&num_kv_heads)
+            .arg(&head_dim)
+            .arg(&block_size)
+            .arg(&max_blocks_per_seq);
+        builder.launch(cfg).map_err(|e| {
+            CoreError::Tensor(format!(
+                "paged_attention_v1_plus kernel launch failed: {e}"
+            ))
+        })?;
 
         Ok(())
     }
@@ -284,6 +408,7 @@ impl PagedAttentionKernels {
         tmp_out: &mut CudaSlice<f32>,
         exp_sums: &mut CudaSlice<f32>,
         max_logits: &mut CudaSlice<f32>,
+        rotation_metadata: &CudaSlice<f32>,
         scale: f32,
         num_heads: i32,
         num_kv_heads: i32,
@@ -293,6 +418,7 @@ impl PagedAttentionKernels {
         num_partitions: i32,
         batch_size: i32,
     ) -> CoreResult<()> {
+        check_paged_attention_head_dim(head_dim)?;
         let stream = self.candle_dev.cuda_stream();
 
         let block_size_x = ((head_dim + 31) / 32 * 32) as u32;
@@ -303,12 +429,28 @@ impl PagedAttentionKernels {
         };
 
         let mut builder = stream.launch_builder(&self.paged_attn_v2_partition_func);
-        builder.arg(query).arg(key_cache).arg(value_cache).arg(block_table).arg(context_lens)
-            .arg(tmp_out).arg(exp_sums).arg(max_logits)
-            .arg(&scale).arg(&num_heads).arg(&num_kv_heads).arg(&head_dim)
-            .arg(&block_size).arg(&max_blocks_per_seq).arg(&num_partitions);
-        builder.launch(cfg)
-            .map_err(|e| CoreError::Tensor(format!("CUDA launch error: {e}")))?;
+        builder
+            .arg(query)
+            .arg(key_cache)
+            .arg(value_cache)
+            .arg(block_table)
+            .arg(context_lens)
+            .arg(tmp_out)
+            .arg(exp_sums)
+            .arg(max_logits)
+            .arg(rotation_metadata)
+            .arg(&scale)
+            .arg(&num_heads)
+            .arg(&num_kv_heads)
+            .arg(&head_dim)
+            .arg(&block_size)
+            .arg(&max_blocks_per_seq)
+            .arg(&num_partitions);
+        builder.launch(cfg).map_err(|e| {
+            CoreError::Tensor(format!(
+                "paged_attention_v2_partition kernel launch failed: {e}"
+            ))
+        })?;
 
         Ok(())
     }
@@ -320,6 +462,7 @@ impl PagedAttentionKernels {
         max_logits: &CudaSlice<f32>,
         tmp_out: &CudaSlice<f32>,
         context_lens: &CudaSlice<i32>,
+        rotation_metadata: &CudaSlice<f32>,
         num_heads: i32,
         head_dim: i32,
         num_partitions: i32,
@@ -331,10 +474,10 @@ impl PagedAttentionKernels {
         // paged_attention_v2_partition.cu and paged_attention_v2_reduce.cu
         const _PARTITION_SIZE: i32 = 256;
 
-        if head_dim > 1024 {
+        if head_dim > MAX_HEAD_DIM_V2_REDUCE {
             return Err(CoreError::Tensor(format!(
-                "head_dim {} exceeds maximum block size 1024 for reduction kernel",
-                head_dim
+                "head_dim {} exceeds maximum block size {} for reduction kernel",
+                head_dim, MAX_HEAD_DIM_V2_REDUCE
             )));
         }
 
@@ -345,10 +488,21 @@ impl PagedAttentionKernels {
         };
 
         let mut builder = stream.launch_builder(&self.paged_attn_v2_reduce_func);
-        builder.arg(output).arg(exp_sums).arg(max_logits).arg(tmp_out).arg(context_lens)
-            .arg(&num_heads).arg(&head_dim).arg(&num_partitions);
-        builder.launch(cfg)
-            .map_err(|e| CoreError::Tensor(format!("CUDA launch error: {e}")))?;
+        builder
+            .arg(output)
+            .arg(exp_sums)
+            .arg(max_logits)
+            .arg(tmp_out)
+            .arg(context_lens)
+            .arg(rotation_metadata)
+            .arg(&num_heads)
+            .arg(&head_dim)
+            .arg(&num_partitions);
+        builder.launch(cfg).map_err(|e| {
+            CoreError::Tensor(format!(
+                "paged_attention_v2_reduce kernel launch failed: {e}"
+            ))
+        })?;
 
         Ok(())
     }

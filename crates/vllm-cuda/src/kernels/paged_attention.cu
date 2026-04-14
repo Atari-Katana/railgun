@@ -14,6 +14,7 @@
 
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "isoquant_utils.cuh"
 
 extern "C" __global__ void paged_attention_v1(
     const float* __restrict__ query,           // [batch, num_heads, head_dim]
@@ -134,4 +135,51 @@ extern "C" __global__ void reshape_and_cache(
 
     k_cache[dst_idx] = k[src_idx];
     v_cache[dst_idx] = v[src_idx];
+}
+
+extern "C" __global__ void reshape_and_cache_isoquant(
+    const float* __restrict__ k,             // [batch, num_kv_heads, head_dim]
+    const float* __restrict__ v,             // [batch, num_kv_heads, head_dim]
+    float* __restrict__ k_cache,             // [num_blocks, num_kv_heads, block_size, head_dim]
+    float* __restrict__ v_cache,             // [num_blocks, num_kv_heads, block_size, head_dim]
+    const int32_t* __restrict__ slot_mapping, // [batch]
+    float* __restrict__ rotation_metadata,   // [num_blocks, num_kv_heads, head_dim / 4, 8]
+    const int num_kv_heads,
+    const int head_dim,
+    const int block_size
+) {
+    const int batch_idx = blockIdx.x;
+    const int head_idx = threadIdx.y;
+    const int dim_group_idx = threadIdx.x; // Processes 4 dimensions
+
+    if (batch_idx >= gridDim.x || head_idx >= num_kv_heads || dim_group_idx * 4 >= head_dim) return;
+
+    const int slot_idx = slot_mapping[batch_idx];
+    if (slot_idx < 0) return;
+
+    const int block_idx = slot_idx / block_size;
+    const int token_offset = slot_idx % block_size;
+
+    const int src_base = (batch_idx * num_kv_heads * head_dim) + (head_idx * head_dim) + (dim_group_idx * 4);
+    float4 k_vec = reinterpret_cast<const float4*>(k + src_base)[0];
+    float4 v_vec = reinterpret_cast<const float4*>(v + src_base)[0];
+
+    float4 qL, qR;
+    const int rot_meta_base = (block_idx * num_kv_heads * (head_dim / 4) * 8) + (head_idx * (head_dim / 4) * 8) + (dim_group_idx * 8);
+
+    if (token_offset == 0) {
+        derive_isoquant(k_vec, qL, qR);
+        reinterpret_cast<float4*>(rotation_metadata + rot_meta_base)[0] = qL;
+        reinterpret_cast<float4*>(rotation_metadata + rot_meta_base)[1] = qR;
+    } else {
+        qL = reinterpret_cast<const float4*>(rotation_metadata + rot_meta_base)[0];
+        qR = reinterpret_cast<const float4*>(rotation_metadata + rot_meta_base)[1];
+    }
+
+    float4 k_rot = apply_isoquant(k_vec, qL, qR);
+    float4 v_rot = apply_isoquant(v_vec, qL, qR);
+
+    const int dst_base = (block_idx * num_kv_heads * block_size * head_dim) + (head_idx * block_size * head_dim) + (token_offset * head_dim) + (dim_group_idx * 4);
+    reinterpret_cast<float4*>(k_cache + dst_base)[0] = k_rot;
+    reinterpret_cast<float4*>(v_cache + dst_base)[0] = v_rot;
 }

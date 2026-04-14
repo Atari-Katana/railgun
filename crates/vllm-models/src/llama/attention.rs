@@ -120,13 +120,16 @@ impl PagedSelfAttention {
             let v_reshaped = v.reshape((total_tokens, self.num_kv_heads, self.head_dim))?;
 
             // 1. Store K/V into Paged Cache
-            op.reshape_and_cache(&k_reshaped, &v_reshaped, &mut k_cache, &mut v_cache, slot_mapping)?;
+            let use_isoquant = true; // For now, we hardcode it.
+            let mut rotation_metadata = kv_cache.rotation_metadata()?;
+            op.reshape_and_cache(&k_reshaped, &v_reshaped, &mut k_cache, &mut v_cache, slot_mapping, &mut rotation_metadata, use_isoquant)?;
 
             // 2. Compute Attention
             if x.rank() == 2 {
                 // PACKED/DECODE PATH
                 let q_reshaped = q.reshape((total_tokens, self.num_heads, self.head_dim))?;
-                let out = op.execute(&q_reshaped, &k_cache, &v_cache, block_table, context_lens, max_context_len)?;
+                let mut rotation_metadata = kv_cache.rotation_metadata()?;
+                let out = op.execute(&q_reshaped, &k_cache, &v_cache, block_table, context_lens, &mut rotation_metadata, max_context_len)?;
                 return self.o_proj.forward(&out.reshape((total_tokens, ()))?);
             }
         }

@@ -39,6 +39,16 @@ inline __device__ float4 apply_isoquant(float4 v, float4 qL, float4 qR) {
     return v_rot;
 }
 
+// Apply inverse SO(4) isoclinic transform.
+// T_inv(v) = conj(qL) * v * qR
+inline __device__ float4 apply_inverse_isoquant(float4 v, float4 qL, float4 qR) {
+    // Left-isoclinic: conj(qL) * v
+    float4 v_rot_left = q_mul(q_conj(qL), v);
+    // Right-isoclinic: (conj(qL) * v) * qR
+    float4 v_rot = q_mul(v_rot_left, qR);
+    return v_rot;
+}
+
 // Derive IsoQuant rotations from a 4D vector v.
 // For now, returns identity rotations (no rotation).
 inline __device__ void derive_isoquant(float4 v, float4& qL, float4& qR) {

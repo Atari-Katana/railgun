@@ -49,6 +49,7 @@ impl PagedAttentionOp {
         v_cache: &Tensor,
         block_table: &Tensor,
         context_lens: &Tensor,
+        rotation_metadata: &Tensor,
         max_context_len: usize,
     ) -> Result<Tensor> {
         if self.head_dim % 4 != 0 {
@@ -68,19 +69,22 @@ impl PagedAttentionOp {
         let (v_storage, _) = v_cache.storage_and_layout();
         let (bt_storage, _) = block_table.storage_and_layout();
         let (cl_storage, _) = context_lens.storage_and_layout();
+        let (rot_storage, _) = rotation_metadata.storage_and_layout();
 
-        match (&*q_storage, &*k_storage, &*v_storage, &*bt_storage, &*cl_storage) {
+        match (&*q_storage, &*k_storage, &*v_storage, &*bt_storage, &*cl_storage, &*rot_storage) {
             (
                 candle_core::Storage::Cuda(q_cuda),
                 candle_core::Storage::Cuda(k_cuda),
                 candle_core::Storage::Cuda(v_cuda),
                 candle_core::Storage::Cuda(bt_cuda),
                 candle_core::Storage::Cuda(cl_cuda),
+                candle_core::Storage::Cuda(rot_cuda),
             ) => {
                 let dev = self.kernels.candle_device();
                 let out_shape = Shape::from((batch_size, num_heads, head_dim));
                 let out_size = out_shape.elem_count();
                 let mut out_cuda = dev.alloc_zeros::<f32>(out_size).map_err(candle_core::Error::from)?;
+                let rot_slice = rot_cuda.as_cuda_slice::<f32>()?;
 
                 if max_context_len <= 4096 {
                     unsafe {
@@ -91,6 +95,7 @@ impl PagedAttentionOp {
                             bt_cuda.as_cuda_slice::<i32>()?,
                             cl_cuda.as_cuda_slice::<i32>()?,
                             &mut out_cuda,
+                            rot_slice,
                             self.scale,
                             num_heads as i32,
                             self.num_kv_heads as i32,
@@ -127,6 +132,7 @@ impl PagedAttentionOp {
                             tmp_out.as_slice_mut(),
                             exp_sums.as_slice_mut(),
                             max_logits.as_slice_mut(),
+                            rot_slice,
                             self.scale,
                             num_heads as i32,
                             self.num_kv_heads as i32,
@@ -143,6 +149,7 @@ impl PagedAttentionOp {
                             max_logits.as_slice(),
                             tmp_out.as_slice(),
                             cl_cuda.as_cuda_slice::<i32>()?,
+                            rot_slice,
                             num_heads as i32,
                             head_dim as i32,
                             num_partitions as i32,
@@ -165,6 +172,8 @@ impl PagedAttentionOp {
         k_cache: &mut Tensor,
         v_cache: &mut Tensor,
         slot_mapping: &Tensor,
+        rotation_metadata: &mut Tensor,
+        use_isoquant: bool,
     ) -> Result<()> {
         let (batch_size, num_kv_heads, head_dim) = k.dims3()?;
         let block_size = self.block_size;
@@ -174,30 +183,48 @@ impl PagedAttentionOp {
         let (kc_storage, _) = k_cache.storage_and_layout();
         let (vc_storage, _) = v_cache.storage_and_layout();
         let (slot_storage, _) = slot_mapping.storage_and_layout();
+        let (rot_storage, _) = rotation_metadata.storage_and_layout();
 
-        match (&*k_storage, &*v_storage, &*kc_storage, &*vc_storage, &*slot_storage) {
+        match (&*k_storage, &*v_storage, &*kc_storage, &*vc_storage, &*slot_storage, &*rot_storage) {
             (
                 candle_core::Storage::Cuda(k_cuda),
                 candle_core::Storage::Cuda(v_cuda),
                 candle_core::Storage::Cuda(kc_cuda),
                 candle_core::Storage::Cuda(vc_cuda),
                 candle_core::Storage::Cuda(slot_cuda),
+                candle_core::Storage::Cuda(rot_cuda),
             ) => {
                 let mut kc_slice = kc_cuda.as_cuda_slice::<f32>()?.clone();
                 let mut vc_slice = vc_cuda.as_cuda_slice::<f32>()?.clone();
-                
+                let mut rot_slice = rot_cuda.as_cuda_slice::<f32>()?.clone();
+
                 unsafe {
-                    self.kernels.launch_reshape_and_cache(
-                        k_cuda.as_cuda_slice::<f32>()?,
-                        v_cuda.as_cuda_slice::<f32>()?,
-                        &mut kc_slice,
-                        &mut vc_slice,
-                        slot_cuda.as_cuda_slice::<i32>()?,
-                        num_kv_heads as i32,
-                        head_dim as i32,
-                        block_size as i32,
-                        batch_size as i32,
-                    ).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                    if use_isoquant {
+                        self.kernels.launch_reshape_and_cache_isoquant(
+                            k_cuda.as_cuda_slice::<f32>()?,
+                            v_cuda.as_cuda_slice::<f32>()?,
+                            &mut kc_slice,
+                            &mut vc_slice,
+                            slot_cuda.as_cuda_slice::<i32>()?,
+                            &mut rot_slice,
+                            num_kv_heads as i32,
+                            head_dim as i32,
+                            block_size as i32,
+                            batch_size as i32,
+                        ).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                    } else {
+                        self.kernels.launch_reshape_and_cache(
+                            k_cuda.as_cuda_slice::<f32>()?,
+                            v_cuda.as_cuda_slice::<f32>()?,
+                            &mut kc_slice,
+                            &mut vc_slice,
+                            slot_cuda.as_cuda_slice::<i32>()?,
+                            num_kv_heads as i32,
+                            head_dim as i32,
+                            block_size as i32,
+                            batch_size as i32,
+                        ).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+                    }
                 }
                 Ok(())
             }

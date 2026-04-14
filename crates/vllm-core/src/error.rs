@@ -43,6 +43,13 @@ pub enum CoreError {
         got: Vec<usize>,
     },
 
+    /// The requested feature is not supported for this operation or backend.
+    #[error("feature '{feature}' is not supported in context '{context}'")]
+    NotSupported {
+        feature: String,
+        context: &'static str,
+    },
+
     /// Two tensors that must live on the same device do not.
     #[error("device mismatch: expected {expected}, got {got}")]
     DeviceMismatch {
@@ -64,6 +71,13 @@ pub enum CoreError {
     #[error("failed to initialise {device}: {reason}")]
     DeviceInit {
         device: Device,
+        reason: String,
+    },
+
+    /// The requested operation is not supported in the current context.
+    #[error("not supported: {feature} - {reason}")]
+    NotSupported {
+        feature: &'static str,
         reason: String,
     },
 
