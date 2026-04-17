@@ -39,6 +39,11 @@ fn test_paged_attention_parity() -> Result<(), Box<dyn std::error::Error>> {
     
     let context_lens = Tensor::from_vec(vec![context_len as i32; batch_size], (batch_size,), &device)?;
 
+    // Dummy rotation metadata for positional encoding
+    let rotation_metadata = Tensor::zeros((batch_size, context_len), candle_core::DType::F32, &device)?;
+    let (rm_storage, _) = rotation_metadata.storage_and_layout();
+
+
     let (q_storage, _) = q.storage_and_layout();
     let (k_storage, _) = k_cache.storage_and_layout();
     let (v_storage, _) = v_cache.storage_and_layout();
@@ -64,6 +69,10 @@ fn test_paged_attention_parity() -> Result<(), Box<dyn std::error::Error>> {
     let cl_cuda = match &*cl_storage {
         candle_core::Storage::Cuda(c) => c,
         _ => panic!("cl is not on CUDA"),
+    };
+    let rm_cuda = match &*rm_storage {
+        candle_core::Storage::Cuda(c) => c,
+        _ => panic!("rm is not on CUDA"),
     };
 
     let mut out_v1 = candle_dev.alloc_zeros::<f32>(batch_size * num_heads * head_dim)?;
@@ -96,6 +105,7 @@ fn test_paged_attention_parity() -> Result<(), Box<dyn std::error::Error>> {
             bt_cuda.as_cuda_slice::<i32>()?,
             cl_cuda.as_cuda_slice::<i32>()?,
             &mut out_v1_plus,
+            rm_cuda.as_cuda_slice::<f32>()?,
             scale,
             num_heads as i32,
             num_kv_heads as i32,
@@ -119,12 +129,13 @@ fn test_paged_attention_parity() -> Result<(), Box<dyn std::error::Error>> {
         kernels.launch_v2_partition(
             q_cuda.as_cuda_slice::<f32>()?,
             k_cuda.as_cuda_slice::<f32>()?,
-            v_cuda.as_cuda_slice::<f32>()?,
+.as_cuda_slice::<f32>()?,
             bt_cuda.as_cuda_slice::<i32>()?,
             cl_cuda.as_cuda_slice::<i32>()?,
             &mut tmp_out,
             &mut exp_sums,
             &mut max_logits,
+            rm_cuda.as_cuda_slice::<f32>()?,
             scale,
             num_heads as i32,
             num_kv_heads as i32,
@@ -141,6 +152,7 @@ fn test_paged_attention_parity() -> Result<(), Box<dyn std::error::Error>> {
             &max_logits,
             &tmp_out,
             cl_cuda.as_cuda_slice::<i32>()?,
+            rm_cuda.as_cuda_slice::<f32>()?,
             num_heads as i32,
             head_dim as i32,
             num_partitions,

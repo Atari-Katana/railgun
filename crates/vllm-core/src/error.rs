@@ -20,34 +20,18 @@ use crate::dtype::DType;
 #[non_exhaustive]
 pub enum CoreError {
     /// A memory allocation request could not be satisfied.
-    ///
-    /// This is returned when GPU or CPU memory is exhausted. The scheduler
-    /// should react by preempting lower-priority requests rather than
-    /// propagating this error to the end user.
     #[error("out of memory on {device}: requested {requested_bytes} bytes")]
     OutOfMemory {
-        /// The device that ran out of memory.
         device: Device,
-        /// How many bytes were requested.
         requested_bytes: usize,
     },
 
     /// A tensor shape was invalid for the requested operation.
-    ///
-    /// This should never occur in production — it indicates a programming bug.
     #[error("invalid shape for {op}: expected {expected:?}, got {got:?}")]
     InvalidShape {
-        /// The operation that detected the mismatch.
         op: &'static str,
         expected: Vec<usize>,
         got: Vec<usize>,
-    },
-
-    /// The requested feature is not supported for this operation or backend.
-    #[error("feature '{feature}' is not supported in context '{context}'")]
-    NotSupported {
-        feature: String,
-        context: &'static str,
     },
 
     /// Two tensors that must live on the same device do not.
@@ -65,9 +49,6 @@ pub enum CoreError {
     },
 
     /// A CUDA device could not be initialised.
-    ///
-    /// This wraps the underlying driver error as a string to avoid a
-    /// dependency on `cudarc` types in `vllm-core`.
     #[error("failed to initialise {device}: {reason}")]
     DeviceInit {
         device: Device,

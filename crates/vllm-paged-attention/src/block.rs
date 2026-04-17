@@ -86,10 +86,6 @@ impl GpuBlockPool {
         })
     }
 
-    pub fn rotation_metadata(&self) -> &CTensor {
-        &self.rotation_metadata
-    }
-
     pub fn k_cache(&self) -> candle_core::Result<CTensor> {
         self.storage.narrow(1, 0, 1)?.squeeze(1)
     }
@@ -121,15 +117,10 @@ impl CpuBlockPool {
         dtype: DType,
     ) -> vllm_core::Result<Self> {
         let shape = [num_blocks, 2, num_kv_heads, block_size, head_dim];
-        let storage = vllm_core::Tensor::zeros(&shape, dtype, device.clone())?;
-
-        let rot_shape = [num_blocks, num_kv_heads, head_dim / 4, 8];
-        let rotation_metadata = vllm_core::Tensor::zeros(&rot_shape, DType::F32, device.clone())?;
+        let storage = vllm_core::Tensor::zeros(&shape, dtype, Device::Cpu)?;
 
         Ok(Self {
             storage: storage.into_inner(),
-            rotation_metadata: rotation_metadata.into_inner(),
-
             block_size,
             num_kv_heads,
             head_dim,
